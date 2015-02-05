@@ -231,11 +231,12 @@ DWORD mq_get_next_msg(struct mqueue *q)
         return j;
 
     /* walk the array */
-    for(i = 1, ++j; i < MQ_MAX_MSG; ++i)
+    for(i = 1, ++j; i < MQ_MAX_MSG; ++i) {
         if(!(q->msg[j].flags & MQ_MSG_ALIVE))
             return j;
         ++j;
         j &= (MQ_MAX_MSG - 1);
+    }
     /* on the off chance something goes wrong */
     return -1;
 }
