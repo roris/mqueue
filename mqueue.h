@@ -20,7 +20,8 @@ struct mq_attr {
     long mq_flags;
     long mq_maxmsg;
     long mq_msgsize;
-    long mq_curmsg;
+    long mq_curmsg;     /* sleep duration in ?? */
+    long mq_sleepdur;   /* sleep duration in ms */
 };
 
 int mq_send(mqd_t mqdes, const char *msg_ptr, size_t msg_len, unsigned msg_prio);
