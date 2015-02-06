@@ -8,6 +8,7 @@
 #include "mqueue.h"
 
 #define MQ_MSG_ALIVE    0x1
+#define MQ_MQD_COPIED   0x2
 
 struct mqd {
     struct mqd         *next;       /* next queue descriptor */
@@ -77,7 +78,14 @@ static void mqd_unlock(struct mqd *d)
     ReleaseMutex(d->lock);
 }
 
-#if 0
+struct mqdtable* get_mqdt(void)
+{
+    return TlsGetValue(tls_index);
+    
+}
+
+
+#ifdef MQDTABLE_LOCK_
 static void mqdtable_lock(struct mqdtable *t)
 {
     EnterCriticalSection(&t->lock);
@@ -87,7 +95,9 @@ static void mqdtable_unlock(struct mqdtable *t)
 {
     LeaveCriticalSection(&t->lock);
 }
+#endif
 
+#if 0
 static struct mqd *mqdtable_get_next_mqd(struct mqdtable *t)
 {
     struct mqd *qd;
@@ -252,7 +262,7 @@ DWORD mqd_get_next_msg(struct mqd *d)
     return -1;
 }
 
-#if 0
+#ifdef MQ_RECV_
 int mq_receive(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 {
     struct mqd *d;
@@ -291,6 +301,7 @@ mq_recv:
 }
 #endif
 
+#ifdef MQ_SEND_
 int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 {
     struct mqd *d;
@@ -299,7 +310,6 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
     struct message *m;
     int res = 0;
     DWORD next;
-    DWORD sleep_dur;
 
     /* msg_size <= to mq_msgsize */
     if(msg_size > MQ_MSG_SIZE) {
@@ -324,18 +334,18 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
     if(mqd_lock(d))
         return -1;
 
-    q = (void*)d->mqd_u.queue;
+    q = d->mqd_u.queue;
     if(q->curmsg > MQ_MAX_MSG) {
         if(d->flags & O_NONBLOCK) {
             res = -1;
             goto mqd_unlock;
-        }
-        do {
+        } else do {
             mqd_unlock(d);
             Sleep(d->mq_attr.mq_sleepdur);
             mqd_lock(d);
-        } while(q->curmsg > MQ_MAX_MSG);
+        } while(q->curmsg >= MQ_MAX_MSG);
     }
+
 
     /* NOTE: queue is guarenteed to be not full, here */
     /* create the message */
@@ -360,3 +370,4 @@ mqd_unlock:
     mqd_unlock(d);
     return res;
 }
+#endif
