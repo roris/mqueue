@@ -7,57 +7,98 @@
 #include <time.h>
 #include "mqueue.h"
 
+#endif
+
 #define MQ_MSG_ALIVE    0x1
 #define MQ_MQD_COPIED   0x2
 
 struct mqd {
-	struct mqd	*next;	/* next queue descriptor */
-	struct mqd	*prev;	/* previous queue descriptor */
+	HANDLE		 lock;	/* lock on the queue */
+	HANDLE		 map;	/* handle to the shared memory */
 	union {
 		volatile struct mqueue *queue;
 		void	*view;
 	} mqd_u;
-	HANDLE		 lock;	/* lock on the queue */
-	HANDLE		 map;	/* handle to the shared memory */
-	int		 flags;	/* private flags */
-	int		 alive;	/* non zero if alive */
-	int		 id;	/* our index */
+	struct mqd	*next;	/* next queue descriptor */
+	struct mqd	*prev;	/* previous queue descriptor */
 	struct mq_attr	 attr;	/* flags for the current queue */
+	int		 flags;	/* private flags */
+	int		 eflags;/* extended flags */
 };
 
 struct message {
-	DWORD	next;		/* index of the next message */
-	DWORD	prev;		/* index of the previous message */
-	WORD	size;		/* size of the message */
-	char	buf[MQ_MSG_SIZE];
-	BYTE	flags;		/* flags */
+	int	next;		/* index of the next message */
+	int	prev;		/* index of the previous message */
+	short	flags;
+	int	size;
+	char	buffer[1];
 };
 
 struct mqueue {
-	long		curmsg;
-	DWORD		next_msg;		/* Next free element or -1 */
-	DWORD		prio_tail[MQ_PRIO_MAX];
-	DWORD		prio_head[MQ_PRIO_MAX];
-	struct message	msg[MQ_MAX_MSG];
-	DWORD		namelen;
-	wchar_t		name[1];
+	int		curmsg;
+	int		msgsize;
+	int		maxmsg;
+	int		free_tail;
+	int		free_head;
+	int		prio_tail[MQ_PRIO_MAX];
+	int		prio_head[MQ_PRIO_MAX];
+	wchar_t		name[MQ_NAME_MAX];
+	struct message	buffer[1];
 };
 
 struct mqdtable {
-	struct mqdtable	*parent;
-	struct mqd	*free_mqs;		/* free mqs */
-	struct mqd	 mqdes[MQ_OPEN_MAX];	/* queue descriptor buffer */
 	CRITICAL_SECTION lock;
-	WORD		 curqueue;		/* number of open queues */
+	struct mqdtable	*parent;
+	struct mqd	*free_mqd;
+	int		 curqueues;
+	struct mqd	 desc[MQ_OPEN_MAX];
 };
 
-static DWORD tls_index;
-static struct mqdtable *global;
+static struct mqdtable *mqdtab;
 
 BOOL mq_dll_main(HINSTANCE, DWORD, LPVOID);
-struct mqdtable *get_mqdt(void);
 struct mqd *get_mqd(mqd_t);
 struct mqueue *mqd_get_mq(struct mqd *);
+
+static int mqdtable_init()
+{
+	if(mqdtab == NULL)
+		mqdtab = calloc(1, sizeof(struct mqdtable));
+
+	if(mqdtab != NULL) {
+		/* create a lock */
+		int i = 1;
+		InitializeCriticalSection(&mqdtab->lock);
+		EnterCriticalSection(&mqdtab->lock);
+		for(; i < MQ_OPEN_MAX; ++i) {
+			mqdtab->desc[i - 1].next = &mqdtab->desc[i];
+			mqdtab->desc[i].prev = &mqdtab->desc[i - 1];
+		}
+		mqdtab->free_mqd = mqdtab->desc;
+		LeaveCriticalSection(&mqdtab->lock);
+		return 0;
+	}
+	return -1;
+}
+
+static void mqdtable_lock(struct mqdtable *t)
+{
+	EnterCriticalSection(&t->lock);
+}
+
+static void mqdtable_unlock(struct mqdtable *t)
+{
+	LeaveCriticalSection(&t->lock);
+}
+
+static struct mqd *get_mqd(mqd_t mqdesc)
+{
+	if(mqdtab != NULL) {
+		if(mqdtab->desc[mqdesc].eflags & MQ_MQD_ALIVE)
+			return mqdtab->desc[mqdesc];
+	}
+	return NULL;
+}
 
 static int mqd_lock(struct mqd *d)
 {
@@ -78,39 +119,7 @@ static void mqd_unlock(struct mqd *d)
 	ReleaseMutex(d->lock);
 }
 
-struct mqdtable *get_mqdt(void)
-{
-	return TlsGetValue(tls_index);
-
-}
-
-static void mqdtable_lock(struct mqdtable *t)
-{
-	EnterCriticalSection(&t->lock);
-}
-
-static void mqdtable_unlock(struct mqdtable *t)
-{
-	LeaveCriticalSection(&t->lock);
-}
-
-static struct mqd *mqdtable_get_next_mqd(struct mqdtable *t)
-{
-	struct mqd *qd;
-	const struct mqd *const end = t->mqdes[MQ_OPEN_MAX];
-
-	/* walk the list */
-	if (t->curqueue == MQ_OPEN_MAX)
-		return NULL;
-
-	/* find a dead qd */
-	for (qd = t->mqdes; qd < &t->mqdes[MQ_OPEN_MAX]; ++qd)
-		if (!qd->alive)
-			return qd;
-
-	return NULL;
-}
-
+#if 0
 /* XXX: How to set gid underwindows? */
 void create_secdesc(mode_t mode)
 {
@@ -143,10 +152,12 @@ void create_secdesc(mode_t mode)
 	acc[0].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
 	acc[0].Trustee.ptrstrName = oth;
 }
+#endif
 
-void inflatecat(WCHAR * dest, const char *src, DWORD dest_size,
-		DWORD * bytes_written)
+void inflatecat(WCHAR *dest, const char *src, DWORD dest_size,
+		DWORD *bytes_written)
 {
+
 	WCHAR *tmp;
 	DWORD tmpsize, destlen;
 
@@ -186,13 +197,18 @@ mqd_t mq_open(const char *name, int oflag, ...)
 	struct mqdtable *mqdt;
 	HANDLE *map;
 	DWORD namesize, err, mapacc;
-	int res;
-	WCHAR tmpn[MAX_PATH];
+	WCHAR lockname[MAX_PATH];
+	WCHAR wname[MAX_PATH];
 	BOOL inherit;
+	va_list al;
+	int res;
 
 	/* change the name to a unicode name */
-	wcscpy(tmp, L"/dev/mq/");
-	inflatecat(tmp, name, MAX_PATH, &namesize);
+	wcscpy(wname, L"/dev/mq/");
+	inflatecat(wname, name, MAX_PATH, &namesize);
+	inflatecat(lockname, name, MAX_PATH, &namesize);
+	wcscat(wname, L".lock");
+
 
 	if (namesize > MAX_PATH) {
 		/* ENAME2LONG */
@@ -227,7 +243,18 @@ mqd_t mq_open(const char *name, int oflag, ...)
 
 	/* map the page file */
 	if (oflags & O_CREAT) {
-		DWORD mem = oflag & O_NORESERVE ? SEC_COMMIT : SEC_RESERVE;
+		mode_t mode;
+		struct mq_attr *attr;
+		DWORD mem;
+
+		va_start(al, n);
+		mode = va_arg(al, mode_t);
+		attr = va_arg(al, struct mq_attr*);
+
+		/* secdesc = create_secdesc(mode); */
+
+
+		mem = oflag & O_NORESERVE ? SEC_COMMIT : SEC_RESERVE;
 		map = CreateFileMappingW(INVALID_HANDLE_VALUE,
 					 NULL,
 					 PAGE_READWRITE | mem,
@@ -236,15 +263,25 @@ mqd_t mq_open(const char *name, int oflag, ...)
 					 tmp);
 		error = GetLastError();
 
-		if (d.map == NULL)
-			goto cleanup;
+		if (map == NULL) {
 
-		if (error == ERROR_ALREADY_EXISTS && oflags & O_EXCL)
-			goto closemap;
+			goto cleanup;
+		}
+
+		if (error == ERROR_ALREADY_EXISTS) {
+			if(oflag & O_EXCL) goto closemap;
+			goto copy_on_open;
+		}
+
 
 	} else {
 		BOOL inherit = !(oflag & O_NOINHERIT);
 		map = OpenFileMappingW(mapacc, inherit, tmp);
+
+		if(map == NULL) {
+			/* ENOENT */
+			goto cleanup;
+		}
 	}
 
 	view = MapViewOfFile(qd->map,
@@ -271,29 +308,33 @@ DWORD mqd_get_next_msg(struct mqd *d)
 	DWORD j;
 	struct mqueue *q;
 	struct message *m;
+	long curmsg, maxmsg;
 
 	/* queue is full */
 	q = (void *)d->mqd_u.queue;
-	if (d->attr.mq_curmsg >= MQ_MAX_MSG)
+	curmsg = q->curmsg;
+	maxmsg = q->maxmsg;
+
+	if (curmsg >= maxmsg)
 		return -1;
 
 	/* an empty queue */
-	if (!d->attr.mq_curmsg)
+	if (!curmsg)
 		return 0;
 
 	j = q->next_msg;
-	m = q->msg;
+	m = &q->msg[j];
 
 	/* next_msg is a free msg */
 	if (!(m->flags & MQ_MSG_ALIVE))
 		return j;
 
 	/* walk the array */
-	for (i = 1, ++j; i < MQ_MAX_MSG; ++i) {
+	for (i = 1, ++j; i < maxmsg; ++i) {
 		if (!(q->msg[j].flags & MQ_MSG_ALIVE))
 			return j;
-		j = (j + 1) & (MQ_MAX_MSG - 1);
-	}
+		j = (j + 1) % (maxmsg - 1);
+	}c
 	/* on the off chance something goes wrong */
 	return -1;
 }
@@ -345,11 +386,21 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 	struct message *prev;
 	struct message *m;
 	int res = 0;
-	long curmsg;
+	long curmsg, msgsize, maxmsg;
 	DWORD next;
 
+	d = get_mqd(des);
+
+	if (d == NULL) {
+		/* EBADF */
+		return -1;
+	}
+
+	q = d->mqd_u.queue;
+	curmsg = q->curmsg;
+
 	/* msg_size <= to mq_msgsize */
-	if (msg_size > MQ_MSG_SIZE) {
+	if (msg_size > d->attr.mq_msgsize) {
 		/* EMSGSIZE */
 		return -1;
 	}
@@ -357,13 +408,6 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 	/* 0 <= msg_prio < MQ_PRIO_MAX */
 	if (msg_prio >= MQ_PRIO_MAX || msg_prio < 0) {
 		/* EINVAL */
-		return -1;
-	}
-
-	d = get_mqd(des);
-
-	if (d == NULL) {
-		/* EBADF */
 		return -1;
 	}
 
@@ -382,49 +426,45 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 		return -1;
 	}
 
-	q = d->mqd_u.queue;
-
 	/* If q->curmsg > MQ_MAX_MSG, then the queue is invalid */
 	curmsg = q->curmsg;
-	if (curmsg > MQ_MAX_MSG) {
+	if (curmsg > d->attr.mq_maxmsg) {
 		/* possibly EBADF */
 		goto bad;
 	}
 
-	if (curmsg == MQ_MAX_MSG) {
+	if (curmsg == d->attr.mq_maxmsg) {
 		if (d->flags & O_NONBLOCK) {
 			/* EAGAIN */
 			goto unlock;
 		} else do {
 				mqd_unlock(d);
 				Sleep(d->mq_attr.mq_sleepdur);
-				/* this should be handled */
 				mqd_lock(d);
-			} while (q->curmsg == MQ_MAX_MSG);
+		} while (q->curmsg == d->attr.mq_maxmsg);
 	}
 
-	if (q->curmsg > MQ_MAX_MSG) {
+	if (q->curmsg > d->attr.mq_maxmsg) {
 		/* EBADF */
 		goto bad;
 	}
 
 	/* create the message */
-	next = q->next_msg;
-	m = (void *)&q->msg[next];
+	m = mqueue_get_message(q->next_msg);
 	m->size = msg_size;
 	m->flags = MQ_MSG_ALIVE;
-	memcpy(m->buf, msg_ptr, msg_size);
+	memcpy(m->buffer, msg_ptr, msg_size);
 
 	/* put the new message in the queue */
-	prev = (void *)&q->msg[q->prio_tail[msg_prio]];
-	prev->next = next;
+	prev = mqueue_get_prio_tail(msg_prio);
+	prev->next = q->next_msg;
 	m->prev = q->prio_tail[msg_prio];
 	m->next = -1;
 
 	/* update the queue */
 	q->prio_tail[msg_prio] = next;
-	d->mq_attr.mq_curmsg = ++q->curmsg;
-	q->next_msg = mqd_get_next_msg(d);
+	d->attr.mq_curmsg = ++q->curmsg;
+	q->next_msg = mqd_find_next_msg(d);
 	goto unlock;
 out:
 	res = -1;
