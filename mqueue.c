@@ -4,6 +4,8 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
+#include <stdatomic.h>
 #include <time.h>
 #include "mqueue.h"
 
@@ -11,20 +13,6 @@
 
 #define MQ_MSG_ALIVE    0x1
 #define MQ_MQD_COPIED   0x2
-
-struct mqd {
-	HANDLE		 lock;	/* lock on the queue */
-	HANDLE		 map;	/* handle to the shared memory */
-	union {
-		volatile struct mqueue *queue;
-		void	*view;
-	} mqd_u;
-	struct mqd	*next;	/* next queue descriptor */
-	struct mqd	*prev;	/* previous queue descriptor */
-	struct mq_attr	 attr;	/* flags for the current queue */
-	int		 flags;	/* private flags */
-	int		 eflags;/* extended flags */
-};
 
 struct message {
 	int	next;		/* index of the next message */
@@ -44,6 +32,20 @@ struct mqueue {
 	int		prio_head[MQ_PRIO_MAX];
 	wchar_t		name[MQ_NAME_MAX];
 	struct message	buffer[1];
+};
+
+struct mqd {
+	HANDLE		 lock;	/* lock on the queue */
+	HANDLE		 map;	/* handle to the shared memory */
+	union {
+		volatile struct mqueue *queue;
+		void	*view;
+	} mqd_u;
+	struct mqd	*next;	/* next queue descriptor */
+	struct mqd	*prev;	/* previous queue descriptor */
+	struct mq_attr	 attr;	/* flags for the current queue */
+	int		 flags;	/* private flags */
+	int		 eflags;/* extended flags */
 };
 
 struct mqdtable {
@@ -154,10 +156,8 @@ void create_secdesc(mode_t mode)
 }
 #endif
 
-void inflatecat(WCHAR *dest, const char *src, DWORD dest_size,
-		DWORD *bytes_written)
+WCHAR *inflate(const char *src, DWORD maxsize)
 {
-
 	WCHAR *tmp;
 	DWORD tmpsize, destlen;
 
@@ -168,6 +168,9 @@ void inflatecat(WCHAR *dest, const char *src, DWORD dest_size,
 				      NULL,
 				      0);
 
+	if (tmpsize > maxsize * sizeof(WCHAR))
+		return NULL;
+
 	tmp = malloc(tmpsize);
 
 	MultiByteToWideChar(CP_THREAD_ACP,
@@ -177,16 +180,9 @@ void inflatecat(WCHAR *dest, const char *src, DWORD dest_size,
 			    tmp,
 			    tmpsize);
 
-	destlen = wcslen(dest);
-
-	if (tmpsize + destlen > dest_size)
-		goto skip_wcscat;
-	wcscat(dest, tmp, tmpsize);
-
-skip_wcscat:
 	if (bytes_written)
-		*bytes_written = tmpsize + destlen;
-	free(tmp);
+		*bytes_written = tmpsize;
+	return tmp;
 }
 
 mqd_t mq_open(const char *name, int oflag, ...)
@@ -194,34 +190,38 @@ mqd_t mq_open(const char *name, int oflag, ...)
 	void *view;
 	struct mqd *qd;
 	struct mqd_lock *lock;
-	struct mqdtable *mqdt;
 	HANDLE *map;
-	DWORD namesize, err, mapacc;
+	WCHAR *wname;
+	DWORD namelen, err, mapacc;
 	WCHAR lockname[MAX_PATH];
-	WCHAR wname[MAX_PATH];
+	WCHAR msgname[MAX_PATH];
 	BOOL inherit;
 	va_list al;
 	int res;
 
-	/* change the name to a unicode name */
-	wcscpy(wname, L"/dev/mq/");
-	inflatecat(wname, name, MAX_PATH, &namesize);
-	inflatecat(lockname, name, MAX_PATH, &namesize);
-	wcscat(wname, L".lock");
+	wname = inflate(name,
+			MAX_PATH - (wcslen(L"/dev/mq/") + wcslen(L".lock")));
 
-
-	if (namesize > MAX_PATH) {
-		/* ENAME2LONG */
+	if(wname == NULL) {
+		/* ENAMETOOLONG */
 		return -1;
 	}
 
+	wcscpy(msgname, L"/dev/mq/");
+	wcscat(msgname, wname);
+	wcscpy(lockname, msgname);
+	wcscat(lockname, L".lock");
+	free(wname);
+
 	/* get the mqdtable for the current thread */
-	mqdt = get_mqdt();
-	mqdtable_lock(mqdt);
+	mqdtable_lock(mqdtab);
 
 	/* get a free mqd in the current thread's table. */
-	qd = mqdt->free_mqs;
-	if (!qd) goto cleanup;
+	qd = mqdtab->free_mqd;
+	if (!qd) {
+		/* EMFILE */
+		goto unlock_table;
+	}
 
 	mqd_create_lock(&d, oflag, name);
 	mqd_lock(&d);
@@ -290,16 +290,17 @@ mqd_t mq_open(const char *name, int oflag, ...)
 	qd->flags = oflag & ~(O_NORESERVE | O_CREAT | O_EXCL);
 	qd->lock = lock;
 	mqdt_to_next_free_mqd(mqdt);
+
+	if(0) {
+cleanup:
+		CloseFileMapping(map);
+		mqd_destroy_lock(lock);
+		res = -1;
+	}
+unlock_table:
 	mqdt_unlock(mqdt);
 out:
 	return res;
-
-closemap:
-	CloseFileMapping(map);
-cleanup:
-	destroy_lock(lock);
-	res = -1;
-	goto out;
 }
 
 DWORD mqd_get_next_msg(struct mqd *d)
