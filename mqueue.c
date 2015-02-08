@@ -246,6 +246,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		mode_t mode;
 		struct mq_attr *attr;
 		DWORD mem;
+		DWORD mapsize;
 
 		va_start(al, n);
 		mode = va_arg(al, mode_t);
@@ -259,7 +260,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 					 NULL,
 					 PAGE_READWRITE | mem,
 					 0,
-					 sizeof(struct mqueue) + namelen,
+					 mapsize,
 					 tmp);
 		error = GetLastError();
 
@@ -298,12 +299,19 @@ cleanup:
 		res = -1;
 	}
 unlock_table:
-	mqdt_unlock(mqdt);
+	mqdtable_unlock(mqdtab);
 out:
 	return res;
 }
 
-DWORD mqd_get_next_msg(struct mqd *d)
+static struct message *mqueue_get_msg(struct mqueue *mq, int index)
+{
+	void *bytes = &((char*)(mq->buffer))[index * mq->sizeofmsg];
+	return bytes;
+}
+
+#if 0
+DWORD mqd_find_next_msg(struct mqd *d)
 {
 	int i;
 	DWORD j;
@@ -323,22 +331,27 @@ DWORD mqd_get_next_msg(struct mqd *d)
 	if (!curmsg)
 		return 0;
 
-	j = q->next_msg;
-	m = &q->msg[j];
+	/* assume free_head contains some message */
+	j = q->free_head;
+	m = mqueue_get_msg(q, j);
 
-	/* next_msg is a free msg */
+	/* free_head is a free msg. This will usually be the case except
+	 * right after a message has been sent/inserted into the queue.
+	 * This function is called to update mqueue->free_head.
+	 */
 	if (!(m->flags & MQ_MSG_ALIVE))
 		return j;
 
-	/* walk the array */
+	/* FIXME: only walk the free list */
 	for (i = 1, ++j; i < maxmsg; ++i) {
-		if (!(q->msg[j].flags & MQ_MSG_ALIVE))
+		if (!(mqueue_get_msg(q, j)->flags & MQ_MSG_ALIVE))
 			return j;
 		j = (j + 1) % (maxmsg - 1);
-	}c
+	}
 	/* on the off chance something goes wrong */
 	return -1;
 }
+#endif
 
 #ifdef MQ_RECV_
 int
@@ -388,7 +401,6 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 	struct message *m;
 	int res = 0;
 	long curmsg, msgsize, maxmsg;
-	DWORD next;
 
 	d = get_mqd(des);
 
@@ -440,7 +452,7 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 			goto unlock;
 		} else do {
 				mqd_unlock(d);
-				Sleep(d->mq_attr.mq_sleepdur);
+				Sleep(d->attr.mq_sleepdur);
 				mqd_lock(d);
 		} while (q->curmsg == d->attr.mq_maxmsg);
 	}
@@ -451,21 +463,19 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 	}
 
 	/* create the message */
-	m = mqueue_get_message(q->next_msg);
+	m = mqueue_get_msg(q, q->free_head);
 	m->size = msg_size;
 	m->flags = MQ_MSG_ALIVE;
 	memcpy(m->buffer, msg_ptr, msg_size);
 
 	/* put the new message in the queue */
-	prev = mqueue_get_prio_tail(msg_prio);
-	prev->next = q->next_msg;
 	m->prev = q->prio_tail[msg_prio];
+	prev = mqueue_get_msg(q, q->prio_tail[msg_prio]);
+	q->prio_tail[msg_prio] = prev->next = q->free_head;
+	q->free_head = m->next;
+	/* TODO: make next to the next highest priority message */
 	m->next = -1;
-
-	/* update the queue */
-	q->prio_tail[msg_prio] = next;
 	d->attr.mq_curmsg = ++q->curmsg;
-	q->next_msg = mqd_find_next_msg(d);
 	goto unlock;
 out:
 	res = -1;
