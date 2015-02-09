@@ -243,17 +243,34 @@ mqd_t mq_open(const char *name, int oflag, ...)
 
 	/* map the page file */
 	if (oflags & O_CREAT) {
-		mode_t mode;
 		struct mq_attr *attr;
+		long msgsize;
+		long maxmsg;
+		size_t somsg;
+		mode_t mode;
 		DWORD mem;
 		DWORD mapsize;
 
 		va_start(al, n);
 		mode = va_arg(al, mode_t);
-		attr = va_arg(al, struct mq_attr*);
+		attr = va_arg(al, struct mq_attr *);
 
 		/* secdesc = create_secdesc(mode); */
 
+
+		/* calculate the required size for the queue */
+		if(attr != NULL) {
+			msgsize = attr->mq_msgsize ? attr->mq_msgsize : MQ_MSG_SIZE;
+			maxmsg = attr->mq_maxmsg ? attr->mq_maxmsg : MQ_MAX_MSG;
+		} else {
+			msgsize = MQ_MSG_SIZE;
+			maxmsg = MQ_MAX_MSG;
+		}
+
+		somsg = (sizeof(struct message) + msgsize - 1) * maxmsg;
+		somsg += somsg % sizeof(int);
+		mapsize = sizeof(struct mqueue) - sizeof(struct message) + msgsize;
+		mapsize += mapsize % sizeof(int);
 
 		mem = oflag & O_NORESERVE ? SEC_COMMIT : SEC_RESERVE;
 		map = CreateFileMappingW(INVALID_HANDLE_VALUE,
@@ -265,7 +282,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		error = GetLastError();
 
 		if (map == NULL) {
-
+			/* TODO: find error values */
 			goto cleanup;
 		}
 
