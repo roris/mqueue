@@ -5,7 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
-#include <stdatomic.h>
 #include <time.h>
 #include "mqueue.h"
 
