@@ -8,10 +8,13 @@
 #include <time.h>
 #include "mqueue.h"
 
-#endif
-
-#define MQ_MSG_ALIVE    0x1
-#define MQ_MQD_COPIED   0x2
+#define MQ_MSG_ALIVE	0x1
+#define MQ_MQD_ALIVE	0x1
+#define MQ_PREFIX	L"/mq/"
+#define MQ_LOCK_SUFFIX	L".lock"
+#define MQ_LOCK_LEN	(wcslen(MQ_LOCK_SUFFIX))
+#define MQ_PREFIX_LEN	(wcslen(MQ_PREFIX))
+#define MQ_NAME_MAX	((MAX_PATH - MQ_LOCK_LEN) - MQ_PREFIX_LEN)
 
 struct message {
 	int	next;		/* index of the next message */
@@ -56,10 +59,6 @@ struct mqdtable {
 };
 
 static struct mqdtable *mqdtab;
-
-BOOL mq_dll_main(HINSTANCE, DWORD, LPVOID);
-struct mqd *get_mqd(mqd_t);
-struct mqueue *mqd_get_mq(struct mqd *);
 
 static int mqdtable_init()
 {
@@ -118,6 +117,30 @@ static int mqd_lock(struct mqd *d)
 static void mqd_unlock(struct mqd *d)
 {
 	ReleaseMutex(d->lock);
+}
+
+static void mqd_create_and_get_lock(struct mqd *d, int oflags, wchar_t *name)
+{
+	if(oflags & O_PRIVATE) {
+		InitializeCriticalSection(&d->lock.critical_section);
+		EnterCriticalSection(&d->lock.critical_section);
+	} else if(oflags & O_CREAT) {
+		d->lock.mutex = CreateMutex(NULL, TRUE, name);
+	} else {
+		d->lock.mutex = OpenMutex(NULL, FALSE, name);
+		WaitForSingleObject(d->lock.mutex, INFINITE);
+	}
+}
+
+static void mqd_destroy_lock(struct mqd *d, int oflags)
+{
+	if(oflags & O_PRIVATE) {
+		ExitCriticalSection(&d->lock.critical_section);
+		DestroyCriticalSection(&d->lock.critical_section);
+	} else {
+		ReleaseMutex(d->lock.mutex);
+		CloseHandle(d->lock.mutex);
+	}
 }
 
 #if 0
@@ -184,37 +207,47 @@ WCHAR *inflate(const char *src, DWORD maxsize)
 	return tmp;
 }
 
+static struct message *mqueue_get_msg(struct mqueue *mq, int index)
+{
+	void *bytes = &((char*)(mq->buffer))[index * mq->msgsize];
+	return bytes;
+}
+
+static int valid_open_attr(struct mq_attr *a)
+{
+	return a->mq_maxmsg > 0 && a->mq_msgsize > 0 && a->mq_sleepdur > 0;
+}
+
 mqd_t mq_open(const char *name, int oflag, ...)
 {
-	struct mqd *qd;
-	struct mqueue *mq;
-	struct mqd_lock *lock;
-	void *view;
-	HANDLE *map;
-	wchar_t *wname;
-	DWORD namelen, err, mapacc;
-	wchar_t lockname[MAX_PATH];
-	wchar_t mqname[MAX_PATH];
-	BOOL inherit;
 	va_list al;
+	struct mqd *qd, d;	/* temporary */
+	struct mqueue *mq;
+	void *view, *map;
+	wchar_t *mqname, *lkname, *wname;
+	wchar_t lkname_[MAX_PATH], mqname_[MAX_PATH];
+	DWORD namelen, err, mapacc;
 	int res;
-	DWORD sleepdur;
+	BOOL inherit;
 
-	wname = inflate(name,
-			MAX_PATH - (wcslen(L"/mq/") + wcslen(L".lock")));
-
+	wname = inflate(name, MQ_NAME_MAX);
 	if(wname == NULL) {
 		/* ENAMETOOLONG */
 		return -1;
 	}
+	wcscpy(mqname_, MQ_PREFIX);
+	wcscat(mqname_, wname);
+	wcscpy(lkname_, wname);
+	wcscat(lkname_, MQ_LOCK_SUFFIX);
 
-	wcscpy(mqname, L"/mq/");
-	wcscat(mqname, wname);
-	wcscpy(lockname, msgname);
-	wcscat(lockname, L".lock");
+	if(oflag & O_PRIVATE) {
+		lkname = mqname = NULL;
+	} else {
+		lkname = lkname_;
+		mqname = mqname_;
+	}
 	free(wname);
 
-	/* get the mqdtable for the current thread */
 	mqdtable_lock(mqdtab);
 
 	/* get a free mqd in the current thread's table. */
@@ -224,8 +257,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		goto unlock_table;
 	}
 
-	mqd_create_lock(&d, oflag, lockname);
-	mqd_lock(&d);
+	mqd_create_and_get_lock(&d, oflag, lkname);
 
 	mapacc = 0;
 	switch (oflag & (O_RDWR | O_WRONLY)) {
@@ -237,95 +269,87 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		break;
 	case O_RDONLY:
 		mapacc = FILE_MAP_READ;
-	default:
-		/* do what? */
-		break;
+	default:		/* O_RDWR | O_WRONLY */
+		goto destroy_lock;
 	}
 
 	/* map the page file */
 	if (oflag & O_CREAT) {
 		struct mq_attr *attr;
-		long msgsize;
-		long maxmsg;
-		size_t somsg;
 		mode_t mode;
-		DWORD mem;
-		DWORD mapsize;
+		DWORD mem, mapsize;
+		int i;
 
-		va_start(al, n);
+		va_start(al, oflag);
 		mode = va_arg(al, mode_t);
 		attr = va_arg(al, struct mq_attr *);
 
 		/* secdesc = create_secdesc(mode); */
 
 		/* Calculate the required size for the queue */
-		if(attr != NULL) {
-			if(attr->mq_maxmsg <= 0 || attr->mq_msgsize <= 0
-				|| attr->mq_sleepdur <= 0) {
-				/* EINVAL */
-				res = -1;
-				goto unlock_table;
-			}
-			maxmsg = attr->mq_maxmsg;
-			msgsize = attr->mq_msgsize;
-			sleepdur = attr->mq_sleepdur;
-		} else {
-			msgsize = MQ_MSG_SIZE;
-			maxmsg = MQ_MAX_MSG;
-		}
+		if(attr == NULL) {
+			d.attr.mq_maxmsg = MQ_MAX_MSG;
+			d.attr.mq_msgsize = MQ_MSG_SIZE;
+		} else if(valid_open_attr(attr)) {
+			d = *attr;
+		} else goto destroy_lock;
 
-		somsg = (sizeof(struct message) + msgsize - 1);
-		somsg += somsg % sizeof(int);
-		mapsize = sizeof(struct mqueue) - sizeof(struct message) + (somsg * maxmsg);
+		d.attr.mq_msgsize = (sizeof(struct message) + d.attr.mq_msgsize - 1);
+		d.attr.mq_msgsize += d.attr.mq_msgsize % sizeof(int);
+		mapsize = sizeof(struct mqueue) - sizeof(struct message) + (d.attr.mq_msgsize * d.attr.mq_maxmsg);
 		mapsize += mapsize % sizeof(int);
-		mem = oflag & O_NORESERVE ? SEC_COMMIT : SEC_RESERVE;
-		map = CreateFileMappingW(INVALID_HANDLE_VALUE,
-					 NULL,
-					 PAGE_READWRITE | mem,
-					 0,
-					 mapsize,
-					 tmp);
+		mem = (oflag & O_NORESERVE ? SEC_COMMIT : SEC_RESERVE)
+			| PAGE_READWRITE;
+
+		map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, mem, 0,
+					 mapsize, mqname);
+
 		error = GetLastError();
 
 		if (map == NULL) {
 			/* TODO: find error values */
-			switch(error) {
-
-			}
-			goto cleanup;
+			goto destroy_lock;
 		}
 
 		if (error == ERROR_ALREADY_EXISTS) {
-			if(oflag & O_EXCL)
-				goto closemap;
-			goto copy_on_open;
+			if(oflag & O_EXCL) goto close_map;
+			goto copy_open;
 		}
 
+		mq = view = MapViewOfFile(map, mapacc, 0, 0, 0);
+		/* mq->curmsg = 0 */
+		mq->maxmsg = d.attr.mq_maxmsg;
+		mq->msgsize = d.attr.mq_curmsg;
+		memcpy(mq->name, mqname, wcslen(mqname));
+		mq->free_tail = maxmsg - 1;
+		for(i = 1; i < maxmsg; ++i) {
+			mqueue_get_msg(i - 1)->next = i;
+			mqueue_get_msg(i)->prev = i;
+		}
+		mqueue_get_msg(maxmsg - 1)->next = -1;
 	} else {
 		BOOL inherit = !(oflag & O_NOINHERIT);
-		map = OpenFileMappingW(mapacc, inherit, tmp);
+		map = OpenFileMappingW(mapacc, inherit, mqname);
 
 		if(map == NULL) {
 			/* ENOENT */
-			goto cleanup;
+			goto destroy_lock;
 		}
+copy_open:
+		mq = view = MapViewOfFile(map, mapacc, 0, 0, 0);
+		d.attr.mq_curmsg = mq->curmsg;
+		d.attr.mq_maxmsg = mq->maxmsg;
+		d.attr.mq_msgsize = mq->msgsize;
 	}
-
-	mq = view = MapViewOfFile(qd->map,
-			     mapacc, 0, 0, sizeof(struct mq) + wnamelen);
-	mq->curmsg = 0;
-	mq->maxmsg = maxmsg;
-	mq->maxsize = maxsize;
-	memcpy(mq->name, qname, sizeof(qname));
-
-	qd->flags = oflag & ~(O_NORESERVE | O_CREAT | O_EXCL);
-	qd->lock = lock;
+	d.map = map;
+	d.mqd_u.view = view;
 	mqdt_to_next_free_mqd(mqdt);
 
 	if(0) {
-cleanup:
+close_map:
 		CloseFileMapping(map);
-		mqd_destroy_lock(lock);
+destroy_lock:
+		mqd_destroy_lock(&d);
 		res = -1;
 	}
 unlock_table:
@@ -334,11 +358,6 @@ out:
 	return res;
 }
 
-static struct message *mqueue_get_msg(struct mqueue *mq, int index)
-{
-	void *bytes = &((char*)(mq->buffer))[index * mq->sizeofmsg];
-	return bytes;
-}
 
 #if 0
 DWORD mqd_find_next_msg(struct mqd *d)
