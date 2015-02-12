@@ -1,5 +1,4 @@
 #include <windows.h>
-#include <malloc.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -228,7 +227,6 @@ mqd_t mq_open(const char *name, int oflag, ...)
 	wchar_t lkname_[MAX_PATH], mqname_[MAX_PATH];
 	DWORD namelen, err, mapacc;
 	int res;
-	BOOL inherit;
 
 	wname = inflate(name, MQ_NAME_MAX);
 	if(wname == NULL) {
@@ -301,8 +299,9 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		mem = (oflag & O_NORESERVE ? SEC_COMMIT : SEC_RESERVE)
 			| PAGE_READWRITE;
 
+		/* if O_PRIVATE */
 		map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, mem, 0,
-					 mapsize, mqname);
+				 mapsize, mqname);
 
 		error = GetLastError();
 
@@ -319,17 +318,16 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		mq = view = MapViewOfFile(map, mapacc, 0, 0, 0);
 		/* mq->curmsg = 0 */
 		mq->maxmsg = d.attr.mq_maxmsg;
-		mq->msgsize = d.attr.mq_curmsg;
-		memcpy(mq->name, mqname, wcslen(mqname));
-		mq->free_tail = maxmsg - 1;
-		for(i = 1; i < maxmsg; ++i) {
+		mq->msgsize = d.attr.mq_msgsize;
+		wcscpy(mq->name, mqname_);
+		mq->free_tail = d.attr.mq_maxmsg - 1;
+		for(i = 1; i < d.attr.mq_maxmsg; ++i) {
 			mqueue_get_msg(i - 1)->next = i;
 			mqueue_get_msg(i)->prev = i;
 		}
 		mqueue_get_msg(maxmsg - 1)->next = -1;
 	} else {
-		BOOL inherit = !(oflag & O_NOINHERIT);
-		map = OpenFileMappingW(mapacc, inherit, mqname);
+		map = OpenFileMappingW(mapacc, !(oflag & O_NOINHERIT), mqname);
 
 		if(map == NULL) {
 			/* ENOENT */
