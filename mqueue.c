@@ -7,7 +7,6 @@
 #include <string.h>
 #include <wchar.h>
 #include <time.h>
-#include <errno.h>
 #include "mqueue.h"
 
 #define SIZE_TO_WLEN(s)	((s) / sizeof(wchar_t) - 1)
@@ -350,8 +349,12 @@ mqd_t mq_open(const char *name, int oflag, ...)
 
 		for(i = 1; i < d.attr.mq_maxmsg; ++i) {
 			mqueue_get_msg(mq, i - 1)->next = i;
-			mqueue_get_msg(mq, i)->prev = i;
+			mqueue_get_msg(mq, i)->prev = i - 1;
 		}
+
+		for(i = 0; i < MQ_PRIO_MAX; ++i)
+			mq->prio_head[i] = mq->prio_tail[i] = -1;
+
 		mqueue_get_msg(mq, d.attr.mq_maxmsg - 1)->next = -1;
 	} else {
 		map = OpenFileMappingW(mapacc, 0, mqname);
@@ -454,45 +457,96 @@ DWORD mqd_find_next_msg(struct mqd *d)
 }
 #endif
 
-#ifdef MQ_RECV_
 int
 mq_receive(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 {
 	struct mqd *d;
-	struct mqueue *q;
+	volatile struct mqueue *q;
 	struct message *m;
 	int nonblock;
 	int err;
 
-	/* SHOULD probably lock here */
 	d = get_mqd(des);
 
+	if(d == NULL || msg_ptr == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+
 	mqd_lock(d);
-	q = mqd_get_mq(d);
+
+	if (!(d->flags & O_RDWR) && (d->flags & O_WRONLY)) {
+		errno = EPERM;
+		return -1;
+	}
+
+	q = d->mqd_u.queue;
+	if(msg_size > q->size)
+		msg_size = q->size;
+
 	nonblock = d->mq_attr.mq_flags & O_NONBLOCK;
+
 	if (msg_prio != NULL) {
-
-mq_recv_prio:
-		m = mq_recv_prio(q, *msg_prio);
-
-		if (m == NULL && nonblock) {
-			Sleep(q->mq_attr.mq_sleepdur);
-			goto mq_recv_prio;
+		if (*msg_prio >= MQ_PRIO_MAX && *msg_prio < 0) {
+			errno = EINVAL;
+			goto bad;
 		}
+
+		if (q->prio_head[*msg_prio] == -1 && nonblock) {
+			errno = EAGAIN;
+			goto bad;
+		}
+
+recv_prio:
+		if(q->prio_head[*msg_prio] != -1) {
+			m = mqueue_get_msg(q, q->prio_head[*msg_prio]);
+			goto recieved;
+		}
+		mqd_unlock(d);
+		Sleep(q->mq_attr.mq_sleepdur);
+		mqd_lock(d);
+		goto recv_prio;
 
 	} else {
-mq_recv:
-		m = mq_recv(q);
-		if (m == NULL && nonblock) {
-			Sleep(q->mq_attr.mq_sleepdur);
-			goto mq_recv;
+		int i;
+		for (i = MQ_PRIO_MAX - 1; i >= 0; ++i) {
+			if(q->prio_head[i] == -1)
+				continue;
+			m = mqueue_get_msg(q, i);
+			goto recieved;
 		}
+
+		if (nonblock) {
+			errno = EAGAIN;
+			goto bad;
+		}
+
+		do {
+			mqd_unlock(d);
+			Sleep(q->mq_attr.mq_sleepdur);
+			mqd_lock(d);
+
+			for (i = MQ_PRIO_MAX - 1; i >= 0; ++i) {
+				if(q->prio_head[i] == -1)
+					continue;
+				m = mqueue_get_msg(q, i);
+				goto recieved;
+			}
+		} while(1);
+	}
+
+recieved:
+	memcpy(msg_ptr, m->buffer, msg_size);
+	err = 0;
+
+	if(0) {
+bad:
+		err = -1;
 	}
 
 	mqd_unlock(d);
 	return err;
 }
-#endif
 
 int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 {
