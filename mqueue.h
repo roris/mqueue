@@ -5,7 +5,6 @@
 
 /* not defined by windows */
 #define O_NONBLOCK	0x10000000L
-#define O_NORESERVE	0x20000000L
 #define O_PRIVATE	0x40000000L
 
 /* MQ constants */
@@ -26,5 +25,7 @@ struct mq_attr {
 
 int mq_send(mqd_t mqdes, const char *msg_ptr, size_t msg_len,
 	    unsigned msg_prio);
+
+mqd_t mq_open(const char *, int oflag, ...);
 
 #endif
