@@ -1,3 +1,4 @@
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <malloc.h>
 #include <errno.h>
@@ -6,6 +7,7 @@
 #include <string.h>
 #include <wchar.h>
 #include <time.h>
+#include <errno.h>
 #include "mqueue.h"
 
 #define SIZE_TO_WLEN(s)	((s) / sizeof(wchar_t) - 1)
@@ -81,7 +83,7 @@ static int mqdtable_init()
 			mqdtab->desc[i - 1].next = &mqdtab->desc[i];
 			mqdtab->desc[i].prev = &mqdtab->desc[i - 1];
 		}
-		mqdtab->free_mqd = mqdtab->desc;
+		mqdtab->free_mqd.head = mqdtab->desc;
 		LeaveCriticalSection(&mqdtab->lock);
 		return 0;
 	}
@@ -201,7 +203,7 @@ void create_secdesc(mode_t mode)
 WCHAR *inflate(const char *src, DWORD maxsize)
 {
 	WCHAR *tmp;
-	DWORD tmpsize, destlen;
+	DWORD tmpsize;
 
 	tmpsize = MultiByteToWideChar(CP_THREAD_ACP,
 				      MB_ERR_INVALID_CHARS,
@@ -241,16 +243,15 @@ mqd_t mq_open(const char *name, int oflag, ...)
 	va_list al;
 	struct mqd *qd, d;	/* temporary */
 	struct mqueue *mq;
-	void *view, *map;
+	HANDLE *map;
 	wchar_t *mqname, *lkname, *wname;
 	wchar_t lkname_[MAX_PATH], mqname_[MAX_PATH];
-	DWORD namelen, err, mapacc;
+	DWORD err, mapacc;
 	int res;
-	BOOL inherit;
 
 	wname = inflate(name, MQ_NAME_MAX);
 	if(wname == NULL) {
-		/* ENAMETOOLONG */
+		errno = ENAMETOOLONG;
 		return -1;
 	}
 	wcscpy(mqname_, MQ_PREFIX);
@@ -281,6 +282,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		mapacc = FILE_MAP_READ;
 		break;
 	default:
+		errno = EINVAL;
 		goto destroy_lock;
 	}
 
@@ -304,17 +306,19 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		} else if(valid_open_attr(attr)) {
 			d.attr = *attr;
 		} else {
-			/* EINVAL */
+			errno = EINVAL;
 			goto destroy_lock;
 		}
 
-		d.attr.mq_msgsize = (sizeof(struct message) + d.attr.mq_msgsize - 1);
+		d.attr.mq_msgsize = (sizeof(struct message)
+					+ d.attr.mq_msgsize - 1);
 		d.attr.mq_msgsize += d.attr.mq_msgsize % sizeof(int);
-		mapsize = sizeof(struct mqueue) - sizeof(struct message) + (d.attr.mq_msgsize * d.attr.mq_maxmsg);
+		mapsize = (sizeof(struct mqueue) - sizeof(struct message))
+				+ (d.attr.mq_msgsize * d.attr.mq_maxmsg);
 		mapsize += mapsize % sizeof(int);
 
-		map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
-					 mapsize, mqname);
+		map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
+					 PAGE_READWRITE, 0, mapsize, mqname);
 
 
 		err = GetLastError();
@@ -326,7 +330,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 
 		if (err == ERROR_ALREADY_EXISTS) {
 			if(oflag & O_EXCL) {
-				/* EEXIST */
+				errno = EEXIST;
 				goto close_map;
 			}
 			goto copy_open;
@@ -353,11 +357,15 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		map = OpenFileMappingW(mapacc, 0, mqname);
 
 		if(map == NULL) {
-			/* ENOENT */
+			errno = ENOENT;
 			goto destroy_lock;
 		}
 copy_open:
 		mq = MapViewOfFile(map, mapacc, 0, 0, 0);
+		if(mq == NULL) {
+			/* XXX: what? */
+			goto close_map;
+		}
 		d.attr.mq_curmsg = mq->curmsg;
 		d.attr.mq_maxmsg = mq->maxmsg;
 		d.attr.mq_msgsize = mq->msgsize;
@@ -373,7 +381,7 @@ copy_open:
 	qd = mqdtab->free_mqd.head;
 
 	if (!qd) {
-		/* EMFILE */
+		errno = EMFILE;
 		goto close_map;
 	}
 
@@ -493,56 +501,58 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 	struct message *prev;
 	struct message *m;
 	int res = 0;
-	long curmsg, msgsize, maxmsg;
+	long curmsg;
 
 	d = get_mqd(des);
 
 	if (d == NULL) {
-		/* EBADF */
-		return -1;
-	}
-
-	q = d->mqd_u.queue;
-	curmsg = q->curmsg;
-
-	/* msg_size <= to mq_msgsize */
-	if (msg_size > d->attr.mq_msgsize) {
-		/* EMSGSIZE */
-		return -1;
-	}
-
-	/* 0 <= msg_prio < MQ_PRIO_MAX */
-	if (msg_prio >= MQ_PRIO_MAX || msg_prio < 0) {
-		/* EINVAL */
-		return -1;
-	}
-
-	/* fail if cannot be written to */
-	if (!(d->flags & (O_RDWR | O_WRONLY))) {
-		/* EPERM */
+		errno = EBADF;
 		return -1;
 	}
 
 	/* mq_send MAYBE allowed to block here. */
 	switch (mqd_lock(d)) {
 	case EBUSY:
-		return -1;
+		/* EWOULDBLOCK? */
+		goto bad;
 	case -1:
 		/* TODO: find out possible errors */
-		return -1;
-	}
-
-	/* If q->curmsg > MQ_MAX_MSG, then the queue is invalid */
-	curmsg = q->curmsg;
-	if (curmsg > d->attr.mq_maxmsg) {
-		/* possibly EBADF */
 		goto bad;
 	}
 
+	q = d->mqd_u.queue;
+
+	/* msg_size <= to mq_msgsize */
+	if (msg_size > d->attr.mq_msgsize) {
+		errno = EMSGSIZE;
+		goto bad;
+	}
+
+	/* 0 <= msg_prio < MQ_PRIO_MAX */
+	if (msg_prio >= MQ_PRIO_MAX || msg_prio < 0) {
+		errno = EINVAL;
+		goto bad;
+	}
+
+	/* fail if cannot be written to */
+	if (!(d->flags & (O_RDWR | O_WRONLY))) {
+		errno = EPERM;
+		goto bad;
+	}
+
+	curmsg = q->curmsg;
+#if MQ_PARANOID
+	/* If q->curmsg > MQ_MAX_MSG, then the queue is invalid */
+	if (curmsg > d->attr.mq_maxmsg) {
+		errno = EBADMSG;
+		goto bad;
+	}
+#endif
+
 	if (curmsg == d->attr.mq_maxmsg) {
 		if (d->flags & O_NONBLOCK) {
-			/* EAGAIN */
-			goto unlock;
+			errno = EAGAIN;
+			goto bad;
 		} else do {
 				mqd_unlock(d);
 				Sleep(d->attr.mq_sleepdur);
@@ -550,10 +560,12 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 		} while (q->curmsg == d->attr.mq_maxmsg);
 	}
 
+#if MQ_PARANOID
 	if (q->curmsg > d->attr.mq_maxmsg) {
-		/* EBADF */
+		errno = EBADMSG;
 		goto bad;
 	}
+#endif
 
 	/* create the message */
 	m = mqueue_get_msg(q, q->free_head);
@@ -569,10 +581,10 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 	/* TODO: make next to the next highest priority message */
 	m->next = -1;
 	d->attr.mq_curmsg = ++q->curmsg;
-	goto unlock;
+	if(0) {
 bad:
-	res = -1;
-unlock:
+		res = -1;
+	}
 	mqd_unlock(d);
 	return res;
 }
