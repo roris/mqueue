@@ -57,7 +57,10 @@ struct mqd {
 struct mqdtable {
 	CRITICAL_SECTION lock;
 	struct mqdtable	*parent;
-	struct mqd	*free_mqd;
+	struct {
+		struct mqd	*tail;
+		struct mqd	*head;
+	} free_mqd, live_mqd;
 	int		 curqueues;
 	struct mqd	 desc[MQ_OPEN_MAX];
 };
@@ -361,15 +364,28 @@ copy_open:
 	}
 	d.map = map;
 	d.mqd_u.queue = mq;
+	d.flags = oflag;
+	d.eflags = MQ_MQD_ALIVE;
 
 	mqdtable_lock(mqdtab);
-	qd = mqdtab->free_mqd;
+
+	/* remove from free list */
+	qd = mqdtab->free_mqd.head;
+
 	if (!qd) {
 		/* EMFILE */
-		mqdtable_unlock(mqdtab);
 		goto close_map;
 	}
-	mqdtable_unlock(mqdtab);
+
+	if(qd->next) qd->next->prev = NULL;
+	else mqdtab->free_mqd.tail = NULL;
+	mqdtab->free_mqd.head = qd->next;
+
+	/* move to live list */
+	qd->prev = mqdtab->live_mqd.tail;
+	if(qd->prev) qd->prev->next = qd;
+	else mqdtab->live_mqd.tail = mqdtab->live_mqd.head = qd;
+	qd->next = NULL;
 
 	*qd = d;
 
@@ -380,6 +396,8 @@ destroy_lock:
 		mqd_destroy_lock(&d, oflag);
 		res = -1;
 	}
+
+	mqdtable_unlock(mqdtab);
 
 	return res;
 }
