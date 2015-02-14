@@ -228,8 +228,9 @@ WCHAR *inflate(const char *src, DWORD maxsize)
 
 static struct message *mqueue_get_msg(volatile struct mqueue *mq, int index)
 {
-	void *bytes = &((char*)(mq->buffer))[index * mq->msgsize];
-	return bytes;
+	if(index < 0)
+		return NULL;
+	return (struct message*)&((char*)(mq->buffer))[index * mq->msgsize];
 }
 
 static int valid_open_attr(struct mq_attr *a)
@@ -413,7 +414,6 @@ destroy_lock:
 	return res;
 }
 
-
 #if 0
 DWORD mqd_find_next_msg(struct mqd *d)
 {
@@ -457,19 +457,26 @@ DWORD mqd_find_next_msg(struct mqd *d)
 }
 #endif
 
+/**
+ * XXX: What happens if a message in the live list is dead? Although it should
+ * not happen under normal circumstances.
+ */
 int
-mq_receive(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned *msg_prio)
+mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 {
 	struct mqd *d;
 	volatile struct mqueue *q;
-	struct message *m;
-	int nonblock;
-	int err;
+	struct message *m, *next, *tail;
+	int err, prio, startprio, minprio, nonblock;
 
-	d = get_mqd(des);
-
-	if(d == NULL || msg_ptr == NULL) {
+	if (msg_ptr == NULL) {
 		errno = EINVAL;
+		return -1;
+	}
+
+	d = get_mqd(d);
+	if(d == NULL) {
+		errno = EBADF;
 		return -1;
 	}
 
@@ -481,39 +488,25 @@ mq_receive(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 	}
 
 	q = d->mqd_u.queue;
-	if(msg_size > q->size)
-		msg_size = q->size;
-
-	nonblock = d->mq_attr.mq_flags & O_NONBLOCK;
 
 	if (msg_prio != NULL) {
-		if (*msg_prio >= MQ_PRIO_MAX && *msg_prio < 0) {
+		minprio = startprio = *msg_prio;
+		if (minprio >= MQ_PRIO_MAX && minprio < 0) {
 			errno = EINVAL;
 			goto bad;
 		}
-
-		if (q->prio_head[*msg_prio] == -1 && nonblock) {
-			errno = EAGAIN;
-			goto bad;
-		}
-
-recv_prio:
-		if(q->prio_head[*msg_prio] != -1) {
-			m = mqueue_get_msg(q, q->prio_head[*msg_prio]);
-			goto recieved;
-		}
-		mqd_unlock(d);
-		Sleep(q->mq_attr.mq_sleepdur);
-		mqd_lock(d);
-		goto recv_prio;
-
 	} else {
-		int i;
-		for (i = MQ_PRIO_MAX - 1; i >= 0; ++i) {
-			if(q->prio_head[i] == -1)
-				continue;
-			m = mqueue_get_msg(q, i);
-			goto recieved;
+		minprio = 0;
+		startprio = MQ_PRIO_MAX - 1;
+	}
+
+	nonblock = d->attr.mq_flags & O_NONBLOCK;
+	while (1) {
+		for (prio = startprio; prio >= minprio; --prio) {
+			if (q->prio_head[prio] != -1) {
+				m = mqueue_get_msg(q, q->prio_head[prio]);
+				goto received;
+			}
 		}
 
 		if (nonblock) {
@@ -521,25 +514,47 @@ recv_prio:
 			goto bad;
 		}
 
-		do {
-			mqd_unlock(d);
-			Sleep(q->mq_attr.mq_sleepdur);
-			mqd_lock(d);
-
-			for (i = MQ_PRIO_MAX - 1; i >= 0; ++i) {
-				if(q->prio_head[i] == -1)
-					continue;
-				m = mqueue_get_msg(q, i);
-				goto recieved;
-			}
-		} while(1);
+		mqd_unlock(d);
+		Sleep(d->attr.mq_sleepdur);
+		mqd_lock(d);
 	}
 
-recieved:
-	memcpy(msg_ptr, m->buffer, msg_size);
+received:
+	if(m->size > msg_size) {
+		errno = EMSGSIZE;
+		goto bad;
+	}
+
+	memcpy(msg_ptr, m->buffer, m->size);
+
+	tail = mqueue_get_msg(q, q->free_tail);
+	next = mqueue_get_msg(q, m->next);
+	m->flags &= ~MQ_MSG_ALIVE;
+
+	/* add to the free list */
+	if (tail) {
+		tail->next = q->prio_head[prio];
+		m->prev = q->free_tail;
+		q->free_tail = q->prio_head[prio];
+	} else {
+		m->prev = -1;
+		m->next = -1;
+		q->free_tail = q->prio_head[prio];
+		q->free_head = q->prio_head[prio];
+	}
+
+	/* remove from the live list */
+	if (next) {
+		next->prev = -1;
+		q->prio_head[prio] = m->next;
+	} else {
+		q->prio_head[prio] = -1;
+		q->prio_tail[prio] = -1;
+	}
+
 	err = 0;
 
-	if(0) {
+	if (0) {
 bad:
 		err = -1;
 	}
