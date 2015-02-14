@@ -342,7 +342,6 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
 					 PAGE_READWRITE, 0, mapsize, mqname);
 
-
 		err = GetLastError();
 
 		if (map == NULL) {
@@ -403,14 +402,13 @@ copy_open:
 
 	mqdtable_lock(mqdtab);
 
-	/* remove from free list */
 	qd = mqdtab->free_mqd.head;
-
 	if (!qd) {
 		errno = EMFILE;
 		goto close_map;
 	}
 
+	/* remove from free list */
 	if (qd->next) qd->next->prev = NULL;
 	else mqdtab->free_mqd.tail = NULL;
 	mqdtab->free_mqd.head = qd->next;
@@ -534,13 +532,16 @@ mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 		return -1;
 	}
 
+	mqdtable_lock(mqdtab);
 	d = get_mqd(des);
 	if (d == NULL) {
 		errno = EBADF;
+		mqdtable_unlock(mqdtab);
 		return -1;
 	}
 
 	mqd_lock(d);
+	mqdtable_unlock(mqdtab);
 
 	if (!(d->flags & O_RDWR) && d->flags & O_WRONLY) {
 		errno = EPERM;
@@ -632,15 +633,18 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 	int res = 0;
 	long curmsg;
 
+	mqdtable_lock(mqdtab);
 	d = get_mqd(des);
 
 	if (d == NULL) {
 		errno = EBADF;
+		mqdtable_unlock(mqdtab);
 		return -1;
 	}
 
 	/* mq_send MAYBE allowed to block here. */
 	switch (mqd_lock(d)) {
+		mqdtable_unlock(mqdtab);
 	case EBUSY:
 		/* EWOULDBLOCK? */
 		goto bad;
