@@ -474,15 +474,15 @@ mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 		return -1;
 	}
 
-	d = get_mqd(d);
-	if(d == NULL) {
+	d = get_mqd(des);
+	if (d == NULL) {
 		errno = EBADF;
 		return -1;
 	}
 
 	mqd_lock(d);
 
-	if (!(d->flags & O_RDWR) && (d->flags & O_WRONLY)) {
+	if (!(d->flags & O_RDWR) && d->flags & O_WRONLY) {
 		errno = EPERM;
 		return -1;
 	}
@@ -520,7 +520,7 @@ mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 	}
 
 received:
-	if(m->size > msg_size) {
+	if (m->size > msg_size) {
 		errno = EMSGSIZE;
 		goto bad;
 	}
