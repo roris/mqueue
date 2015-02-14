@@ -70,10 +70,10 @@ static struct mqdtable *mqdtab;
 
 static int mqdtable_init()
 {
-	if(mqdtab == NULL)
+	if (mqdtab == NULL)
 		mqdtab = calloc(1, sizeof(struct mqdtable));
 
-	if(mqdtab != NULL) {
+	if (mqdtab != NULL) {
 		/* create a lock */
 		int i = 1;
 		InitializeCriticalSection(&mqdtab->lock);
@@ -101,8 +101,8 @@ static void mqdtable_unlock(struct mqdtable *t)
 
 static struct mqd *get_mqd(mqd_t mqdesc)
 {
-	if(mqdtab != NULL) {
-		if(mqdtab->desc[mqdesc].eflags & MQ_MQD_ALIVE)
+	if (mqdtab != NULL) {
+		if (mqdtab->desc[mqdesc].eflags & MQ_MQD_ALIVE)
 			return &mqdtab->desc[mqdesc];
 	}
 	return NULL;
@@ -112,8 +112,8 @@ static int mqd_lock(struct mqd *d)
 {
 	DWORD ms = (d->flags & O_NONBLOCK) ? 1 : INFINITE;
 
-	if(d->flags & O_PRIVATE && d->flags & O_NONBLOCK) {
-		if(d->flags & O_NONBLOCK) {
+	if (d->flags & O_PRIVATE && d->flags & O_NONBLOCK) {
+		if (d->flags & O_NONBLOCK) {
 			LPCRITICAL_SECTION cs = &d->lock.critical_section;
 			int res = TryEnterCriticalSection(cs);
 			return res == 1 ? 0 : -1;
@@ -134,7 +134,7 @@ static int mqd_lock(struct mqd *d)
 
 static void mqd_unlock(struct mqd *d)
 {
-	if(d->flags & O_PRIVATE)
+	if (d->flags & O_PRIVATE)
 		LeaveCriticalSection(&d->lock.critical_section);
 	else
 		ReleaseMutex(d->lock.mutex);
@@ -142,10 +142,10 @@ static void mqd_unlock(struct mqd *d)
 
 static void mqd_create_and_get_lock(struct mqd *d, int oflags, wchar_t *name)
 {
-	if(oflags & O_PRIVATE) {
+	if (oflags & O_PRIVATE) {
 		InitializeCriticalSection(&d->lock.critical_section);
 		EnterCriticalSection(&d->lock.critical_section);
-	} else if(oflags & O_CREAT) {
+	} else if (oflags & O_CREAT) {
 		d->lock.mutex = CreateMutexW(NULL, TRUE, name);
 	} else {
 		d->lock.mutex = OpenMutexW(SYNCHRONIZE, FALSE, name);
@@ -155,7 +155,7 @@ static void mqd_create_and_get_lock(struct mqd *d, int oflags, wchar_t *name)
 
 static void mqd_destroy_lock(struct mqd *d, int oflags)
 {
-	if(oflags & O_PRIVATE) {
+	if (oflags & O_PRIVATE) {
 		LeaveCriticalSection(&d->lock.critical_section);
 		DeleteCriticalSection(&d->lock.critical_section);
 	} else {
@@ -228,7 +228,7 @@ WCHAR *inflate(const char *src, DWORD maxsize)
 
 static struct message *mqueue_get_msg(volatile struct mqueue *mq, int index)
 {
-	if(index < 0)
+	if (index < 0)
 		return NULL;
 	return (struct message*)&((char*)(mq->buffer))[index * mq->msgsize];
 }
@@ -250,7 +250,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 	int res;
 
 	wname = inflate(name, MQ_NAME_MAX);
-	if(wname == NULL) {
+	if (wname == NULL) {
 		errno = ENAMETOOLONG;
 		return -1;
 	}
@@ -259,7 +259,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 	wcscpy(lkname_, wname);
 	wcscat(lkname_, MQ_LOCK_SUFFIX);
 
-	if(oflag & O_PRIVATE) {
+	if (oflag & O_PRIVATE) {
 		lkname = mqname = NULL;
 	} else {
 		lkname = lkname_;
@@ -300,10 +300,10 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		/* secdesc = create_secdesc(mode); */
 
 		/* Calculate the required size for the queue */
-		if(attr == NULL) {
+		if (attr == NULL) {
 			d.attr.mq_maxmsg = MQ_MAX_MSG;
 			d.attr.mq_msgsize = MQ_MSG_SIZE;
-		} else if(valid_open_attr(attr)) {
+		} else if (valid_open_attr(attr)) {
 			d.attr = *attr;
 		} else {
 			errno = EINVAL;
@@ -329,7 +329,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		}
 
 		if (err == ERROR_ALREADY_EXISTS) {
-			if(oflag & O_EXCL) {
+			if (oflag & O_EXCL) {
 				errno = EEXIST;
 				goto close_map;
 			}
@@ -338,7 +338,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 
 		mq = MapViewOfFile(map, mapacc, 0, 0, 0);
 
-		if(mq == NULL) {
+		if (mq == NULL) {
 			/* TODO: find possible error values */
 			goto close_map;
 		}
@@ -348,25 +348,25 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		memcpy(mq->name, mqname, wcslen(mqname));
 		mq->free_tail = d.attr.mq_maxmsg - 1;
 
-		for(i = 1; i < d.attr.mq_maxmsg; ++i) {
+		for (i = 1; i < d.attr.mq_maxmsg; ++i) {
 			mqueue_get_msg(mq, i - 1)->next = i;
 			mqueue_get_msg(mq, i)->prev = i - 1;
 		}
 
-		for(i = 0; i < MQ_PRIO_MAX; ++i)
+		for (i = 0; i < MQ_PRIO_MAX; ++i)
 			mq->prio_head[i] = mq->prio_tail[i] = -1;
 
 		mqueue_get_msg(mq, d.attr.mq_maxmsg - 1)->next = -1;
 	} else {
 		map = OpenFileMappingW(mapacc, 0, mqname);
 
-		if(map == NULL) {
+		if (map == NULL) {
 			errno = ENOENT;
 			goto destroy_lock;
 		}
 copy_open:
 		mq = MapViewOfFile(map, mapacc, 0, 0, 0);
-		if(mq == NULL) {
+		if (mq == NULL) {
 			/* XXX: what? */
 			goto close_map;
 		}
@@ -389,19 +389,19 @@ copy_open:
 		goto close_map;
 	}
 
-	if(qd->next) qd->next->prev = NULL;
+	if (qd->next) qd->next->prev = NULL;
 	else mqdtab->free_mqd.tail = NULL;
 	mqdtab->free_mqd.head = qd->next;
 
 	/* move to live list */
 	qd->prev = mqdtab->live_mqd.tail;
-	if(qd->prev) qd->prev->next = qd;
+	if (qd->prev) qd->prev->next = qd;
 	else mqdtab->live_mqd.tail = mqdtab->live_mqd.head = qd;
 	qd->next = NULL;
 
 	*qd = d;
 
-	if(0) {
+	if (0) {
 close_map:
 		CloseHandle(map);
 destroy_lock:
@@ -650,7 +650,7 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 	/* TODO: make next to the next highest priority message */
 	m->next = -1;
 	d->attr.mq_curmsg = ++q->curmsg;
-	if(0) {
+	if (0) {
 bad:
 		res = -1;
 	}
