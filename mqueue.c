@@ -18,6 +18,19 @@
 #define MQ_PREFIX_LEN	(SIZE_TO_WLEN(sizeof(MQ_PREFIX)))
 #define MQ_NAME_MAX	((MAX_PATH - MQ_LOCK_LEN) - MQ_PREFIX_LEN)
 
+/**
+ * XXX: mq_send/receive: What happens if a message in the live list is dead,
+ * Although it should not happen under normal circumstances?
+ *
+ * XXX: If a process has two threads, and one thread calls mq_close and another
+ * calls mq_receive, with the first thread successfully closing the queue after
+ * the second thread has retrieved the pointer to the queue, mq_receive would
+ * fail on trying to lock the queue, as the lock would be non existent. Same
+ * for mq_send and mq_set/getattr.
+ *
+ */
+
+
 struct message {
 	int	next;		/* index of the next message */
 	int	prev;		/* index of the previous message */
@@ -108,17 +121,17 @@ static struct mqd *get_mqd(mqd_t mqdesc)
 	return NULL;
 }
 
-static int mqd_lock(struct mqd *d)
+static int mqd_lock(volatile struct mqd *d)
 {
 	DWORD ms = (d->flags & O_NONBLOCK) ? 1 : INFINITE;
 
 	if (d->flags & O_PRIVATE && d->flags & O_NONBLOCK) {
 		if (d->flags & O_NONBLOCK) {
-			LPCRITICAL_SECTION cs = &d->lock.critical_section;
+			CRITICAL_SECTION *cs = (void*)&d->lock.critical_section;
 			int res = TryEnterCriticalSection(cs);
 			return res == 1 ? 0 : -1;
 		}
-		EnterCriticalSection(&d->lock.critical_section);
+		EnterCriticalSection((void*)&d->lock.critical_section);
 		return 0;
 	}
 
@@ -132,10 +145,10 @@ static int mqd_lock(struct mqd *d)
 	return -1;
 }
 
-static void mqd_unlock(struct mqd *d)
+static void mqd_unlock(volatile struct mqd *d)
 {
 	if (d->flags & O_PRIVATE)
-		LeaveCriticalSection(&d->lock.critical_section);
+		LeaveCriticalSection((void*)&d->lock.critical_section);
 	else
 		ReleaseMutex(d->lock.mutex);
 }
@@ -153,15 +166,23 @@ static void mqd_create_and_get_lock(struct mqd *d, int oflags, wchar_t *name)
 	}
 }
 
-static void mqd_destroy_lock(struct mqd *d, int oflags)
+static void mqd_destroy_owned_lock(struct mqd *d, int oflag)
 {
-	if (oflags & O_PRIVATE) {
-		LeaveCriticalSection(&d->lock.critical_section);
+	if(oflag & O_PRIVATE) {
 		DeleteCriticalSection(&d->lock.critical_section);
 	} else {
-		ReleaseMutex(d->lock.mutex);
 		CloseHandle(d->lock.mutex);
 	}
+}
+
+static void mqd_destroy_lock(struct mqd *d, int oflag)
+{
+	if (oflag & O_PRIVATE) {
+		EnterCriticalSection(&d->lock.critical_section);
+	} else {
+		WaitForSingleObject(d->lock.mutex, INFINITE);
+	}
+	mqd_destroy_owned_lock(d, oflag);
 }
 
 #if 0
@@ -228,7 +249,7 @@ WCHAR *inflate(const char *src, DWORD maxsize)
 
 static struct message *mqueue_get_msg(volatile struct mqueue *mq, int index)
 {
-	if (index < 0)
+	if (index < 0 || index >= MQ_OPEN_MAX)
 		return NULL;
 	return (struct message*)&((char*)(mq->buffer))[index * mq->msgsize];
 }
@@ -241,7 +262,8 @@ static int valid_open_attr(struct mq_attr *a)
 mqd_t mq_open(const char *name, int oflag, ...)
 {
 	va_list al;
-	struct mqd *qd, d;	/* temporary */
+	struct mqd d;	/* temporary */
+	volatile struct mqd *qd;
 	struct mqueue *mq;
 	HANDLE *map;
 	wchar_t *mqname, *lkname, *wname;
@@ -414,6 +436,48 @@ destroy_lock:
 	return res;
 }
 
+int mq_close(mqd_t mqdes)
+{
+	volatile struct mqd *d;
+
+	/* lock table first */
+	mqdtable_lock(mqdtab);
+
+	d = get_mqd(mqdes);
+
+	if (d == NULL) {
+		errno = EBADF;
+		return -1;
+	}
+
+	mqd_lock(d);
+
+	UnmapViewOfFile(d->mqd_u.view);
+	CloseHandle(d->map);
+
+	/* remove from live list */
+	if (d->next)
+		d->next->prev = d->prev;
+	if (d->prev)
+		d->prev->next = d->next;
+
+	/* insert into free list */
+	if (mqdtab->free_mqd.tail) {
+		mqdtab->free_mqd.tail->next = d;
+		d->prev = mqdtab->free_mqd.tail;
+		mqdtab->free_mqd.tail = d;
+		d->next = NULL;
+	} else {
+		mqdtab->free_mqd.tail = mqdtab->free_mqd.head = d;
+		d->next = d->prev = NULL;
+	}
+
+	/* finally destroy the queue's lock and release the table's lock */
+	mqd_destroy_owned_lock(d, d->flags);
+	mqdtable_unlock(mqdtab);
+	return 0;
+}
+
 #if 0
 DWORD mqd_find_next_msg(struct mqd *d)
 {
@@ -457,10 +521,6 @@ DWORD mqd_find_next_msg(struct mqd *d)
 }
 #endif
 
-/**
- * XXX: What happens if a message in the live list is dead? Although it should
- * not happen under normal circumstances.
- */
 int
 mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 {
