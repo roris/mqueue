@@ -657,3 +657,9 @@ bad:
 	mqd_unlock(d);
 	return res;
 }
+
+int mq_unlink(const char *name)
+{
+	errno = ENOSYS;
+	return -1;
+}
