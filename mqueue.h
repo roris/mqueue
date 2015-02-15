@@ -24,8 +24,9 @@ struct mq_attr {
 };
 
 int mq_send(mqd_t mqdes, const char *msg_ptr, size_t msg_len,
-	    unsigned msg_prio);
-
+	unsigned msg_prio);
+int mq_receive(mqd_t mqdes, char *msg_ptr, size_t msg_len, unsigned msg_prio);
 mqd_t mq_open(const char *, int oflag, ...);
+int mq_close(mqd_t mqdes);
 
 #endif
