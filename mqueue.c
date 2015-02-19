@@ -1,7 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <malloc.h>
 #include <errno.h>
+#include <windows.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,26 +16,6 @@
 #define MQ_LOCK_LEN	(SIZE_TO_WLEN(sizeof(MQ_LOCK_SUFFIX)))
 #define MQ_PREFIX_LEN	(SIZE_TO_WLEN(sizeof(MQ_PREFIX)))
 #define MQ_NAME_MAX	((MAX_PATH - MQ_LOCK_LEN) - MQ_PREFIX_LEN)
-
-/**
- * XXX: mq_send/receive: What happens if a message in the live list is dead,
- * Although it should not happen under normal circumstances?
- *
- * XXX: If a process has two threads, and one thread calls mq_close and another
- * 	calls mq_receive, with the first thread successfully closing the queue
- * 	after the second thread has retrieved the pointer to the queue,
- * 	mq_receive would fail on trying to lock the queue, as the lock would be
- * 	non existent. Same for any functions other than mq_open/close.
- *
- * 	Solution: lock the table before getting a mqd, lock the mqd, then
- * 		  unlock the table, if the table does not get altered.
- *
- * XXX: If a thread is full in mq_send (or empty in mq_receive), and O_NONBLOCK
- * 	was no set, then the functions, may own a descriptor that can get
- * 	corrupted by a successful call to mq_close from another thread.
- *
- */
-
 
 struct message {
 	int	next;		/* index of the next message */
@@ -83,6 +62,9 @@ struct mqdtable {
 
 static struct mqdtable *mqdtab;
 
+static void mqd_destroy_mutex(volatile struct mqd *);
+static void mqd_destroy_private_lock(volatile struct mqd *);
+
 static int mqdtable_init(void)
 {
 	if (mqdtab == NULL)
@@ -114,54 +96,64 @@ static void mqdtable_unlock(void)
 	LeaveCriticalSection(&mqdtab->lock);
 }
 
-static struct mqd *mqdtable_get_mqd(mqd_t mqdes)
+static struct mqd *get_mqd(mqd_t mqdes)
 {
-	if(mqdes < 0 || mqdes >= MQ_OPEN_MAX)
-		return NULL;
+	if (mqdes < 0 || mqdes >= MQ_OPEN_MAX)
+		goto bad;
 
+	/* set errno to EBADF? */
 	if (mqdtab->desc[mqdes].eflags & MQ_MQD_ALIVE)
 		return &mqdtab->desc[mqdes];
 
+bad:
+	errno = EBADF;
 	return NULL;
 }
 
-static int mqd_lock_mutex(struct mqd *d)
+static int mqd_lock_mutex(volatile struct mqd *d)
 {
-	switch (WaitForSingleObjext(d->mutex)) {
+	switch (WaitForSingleObject((void*)d->mutex, INFINITE)) {
 	case WAIT_ABANDONED:
-		return EBADMSG;
+		errno = EBADMSG;
+		return -1;
 	case WAIT_OBJECT_0:
 		return 0;
-	case WAIT_FAILED:
-	default:
-		return EOTHER;
 	}
+	errno = EOTHER;
+	return -1;
+}
+
+static void mqd_unlock_mutex(volatile struct mqd *d)
+{
+	ReleaseMutex((void*)d->mutex);
+}
+
+
+static void mqd_private_lock(volatile struct mqd *d)
+{
+	EnterCriticalSection((void*)&d->private_lock);
 }
 
 static int mqd_lock(volatile struct mqd *d)
 {
-	mqd_public_lock();
+	mqd_private_lock(d);
 	mqd_lock_mutex(d);
+	return 0;
 }
 
-static void mqd_private_lock(struct mqd *d)
-{
-	EnterCriticalSection(&d->private_lock);
-}
-
-static struct mqd *mqdtable_get_and_lock_mqd(mqd_t mqdes)
+static struct mqd *get_and_lock_mqd(mqd_t mqdes)
 {
 	/* assume that mqdtab is never NULL */
 	struct mqd *res;
 
-	mqdtable_lock(mqdtab);
+	mqdtable_lock();
 
-	res = mqdtable_get_mqd(mqdes);
+	res = get_mqd(mqdes);
 
 	if(res != NULL)
 		mqd_lock(res);
 
-	mqdtable_unlock(mqdtab);
+	mqdtable_unlock();
 
 	return res;
 }
@@ -169,56 +161,70 @@ static struct mqd *mqdtable_get_and_lock_mqd(mqd_t mqdes)
 static void mqd_unlock(volatile struct mqd *d)
 {
 	mqd_private_unlock(d);
-	mqd_public_unlock(d);
+	mqd_unlock_mutex(d);
 }
 
-static void mqd_create_private_lock(struct mqd *d)
+static void mqd_create_private_lock(volatile struct mqd *d)
 {
-	InitializeCriticalSection(&d->private_lock);
+	InitializeCriticalSection((void*)&d->private_lock);
 }
 
-
-static int mqd_create_and_lock_mutex(struct mqd *d, int oflag, wchar_t *name)
+/* ASSUME: descriptor is for a public queue. */
+static int mqd_create_and_lock_mutex(struct mqd *d, wchar_t *name)
 {
 	int err;
-	if (!(oflag & O_PRIVATE)) {
-		if (oflag & O_CREAT) {
-			d->mutex = CreateMutexW(NULL, TRUE, name);
-			err = GetLastError();
+	int flags = d->flags;
 
-			if (err == ERROR_ALREADY_EXISTS) {
-				err = mqd_lock_mutex(d);
+	if (flags & O_CREAT) {
+		d->mutex = CreateMutexW(NULL, TRUE, name);
+		err = GetLastError();
 
-				if (err == 0)
-					return EEXIST;
+		if (err == ERROR_ALREADY_EXISTS) {
+			errno = EEXIST;
+			/* FAIL only if O_EXCL is set */
+			if (d->flags & O_EXCL)
+				return -1;
 
-				return err;
-			}
-
-			if (d->mutex != NULL)
-				return 0;
-
-			if (err == ERROR_ACCESS_DENIED)
-				return EACCES;
-		} else {
-			d->mutex = OpenMutexW(SYNCHRONIZE, FALSE, name);
-
-			if (d->mutex != NULL) {
-				return mqd_lock_mutex(d);
-			}
-
-			err = GetLastError();
-
-			if (err == ERROR_NOT_FOUND)
-				return ENOENT;
+			/* Signal the mutex. Errno will get changed on
+			 * failure which is OK.
+			 */
+			mqd_lock_mutex(d);
+			return -1;
 		}
+
+		/* mutex probably exists, so try to get a handle */
+		if (err == ERROR_ACCESS_DENIED)
+			goto open_mutex;
+
+		/* A mutex was opened and locked! */
+		if (d->mutex != NULL)
+			return 0;
+
 	} else {
-		return 0;
+open_mutex:
+		d->mutex = OpenMutexW(SYNCHRONIZE, FALSE, name);
+
+		/*
+		 * If a handle was obtained, then return the value.
+		 * FIXME: handle wait failure.
+		 */
+		if (d->mutex != NULL)
+			return mqd_lock_mutex(d);
+
+		/* mutex is null, check last and set ENOENT, if the
+		 * mutex does not exist.
+		 */
+		err = GetLastError();
+		if (err == ERROR_NOT_FOUND) {
+			errno = ENOENT;
+			return -1;
+		}
 	}
-eoth:
+
+	/* No idea what error codes lead to this */
 	SetLastError(err);
-	err = EOTHER;
-	return err;
+	errno = EOTHER;
+	return -1;
 }
 
 #if 0
@@ -318,6 +324,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 	wcscpy(mqname_, MQ_PREFIX);
 	wcscat(mqname_, wname);
 
+	/* Only copy for public names */
 	if (!private) {
 		wcscpy(lkname_, wname);
 		wcscat(lkname_, MQ_LOCK_SUFFIX);
@@ -333,37 +340,10 @@ mqd_t mq_open(const char *name, int oflag, ...)
 
 	memset(&d, 0, sizeof(d));
 
-	/* Try to own the queue first, before creating it. */
-	if (!private) {
-		err = mqd_create_and_lock_mutex(&d, oflag, lkname);
-		/* when O_CREAT is set - continue with O_EXCL? */
-		if (err == EEXIST)
-			oflag &= ~O_EXCL;
-
-		/* attempt to create it again? */
-		if (err == EACCES) {
-			oflag &= ~O_CREAT;
-			/* check for possible error values */
-			err = mqd_create_and_lock_mutex(&d, oflag, lkname);
-		}
-
-		if (err == ENOENT) {
-			errno = ENOENT;
+	/* If public, try to lock the queue first. */
+	if (!private && mqd_create_and_lock_mutex(&d, lkname)) {
+		if ((errno == EEXIST && oflag & O_EXCL) || errno == EOTHER)
 			return -1;
-		}
-
-		if (err == EOTHER) {
-			errno = EOTHER;
-			return -1;
-		}
-
-		if (err == EBADMSG) {
-			/* destroy the queue? */
-			/* A valid handle is present, destroy it. */
-			CloseHandle(d.mutex);
-			errno = EBADMSG;
-			return -1;
-		}
 	}
 
 	mapacc = 0;
@@ -395,7 +375,6 @@ mqd_t mq_open(const char *name, int oflag, ...)
 
 		/* secdesc = create_secdesc(mode); */
 
-		/* Calculate the required size for the queue */
 		if (attr == NULL) {
 			d.attr.mq_maxmsg = MQ_MAX_MSG;
 			d.attr.mq_msgsize = MQ_MSG_SIZE;
@@ -406,6 +385,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 			goto destroy_lock;
 		}
 
+		/* Calculate the required size for the queue */
 		d.attr.mq_msgsize = (sizeof(struct message)
 					+ d.attr.mq_msgsize - 1);
 		d.attr.mq_msgsize += d.attr.mq_msgsize % sizeof(int);
@@ -419,7 +399,9 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		err = GetLastError();
 
 		if (map == NULL) {
-			/* TODO: find error values */
+			/* let the application handle failure :) */
+			SetLastError(err);
+			errno = EOTHER;
 			goto destroy_lock;
 		}
 
@@ -434,7 +416,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		mq = MapViewOfFile(map, mapacc, 0, 0, 0);
 
 		if (mq == NULL) {
-			/* TODO: find possible error values */
+			errno = EOTHER;
 			goto close_map;
 		}
 
@@ -462,7 +444,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 copy_open:
 		mq = MapViewOfFile(map, mapacc, 0, 0, 0);
 		if (mq == NULL) {
-			/* XXX: what? */
+			errno = EOTHER;
 			goto close_map;
 		}
 		d.attr.mq_curmsg = mq->curmsg;
@@ -474,7 +456,7 @@ copy_open:
 	d.flags = oflag;
 	d.eflags = MQ_MQD_ALIVE;
 
-	mqdtable_lock(mqdtab);
+	mqdtable_lock();
 	qd = mqdtab->free_mqd.head;
 
 	if (!qd) {
@@ -489,8 +471,8 @@ copy_open:
 
 	/* move to live list */
 	qd->prev = mqdtab->live_mqd.tail;
-	if (qd->prev) qd->prev->next = qd;
-	else mqdtab->live_mqd.tail = mqdtab->live_mqd.head = qd;
+	if (qd->prev) qd->prev->next = (void*)qd;
+	else mqdtab->live_mqd.tail = mqdtab->live_mqd.head = (void*)qd;
 	qd->next = NULL;
 	mqd_create_private_lock(&d);
 	*qd = d;
@@ -503,11 +485,11 @@ copy_open:
 close_map:
 		CloseHandle(map);
 destroy_lock:
-		mqd_destroy_mutex(&d, oflag);
+		mqd_destroy_mutex(&d);
 		res = -1;
 	}
 
-	mqdtable_unlock(mqdtab);
+	mqdtable_unlock();
 
 	return res;
 }
@@ -519,7 +501,7 @@ int mq_close(mqd_t mqdes)
 
 	/* lock table first */
 	mqdtable_lock();
-	d = mqdtable_get_mqd(mqdes);
+	d = get_mqd(mqdes);
 
 	if (d == NULL) {
 		errno = EBADF;
@@ -532,7 +514,8 @@ int mq_close(mqd_t mqdes)
 	 * public lock as the queue itself is not altered. No need to unlock
 	 * the private lock.
 	 */
-	EnterCriticalSection(&d->private_lock);
+	mqd_private_lock(d);
+	d->flags &= ~MQ_MQD_ALIVE;
 
 	/* free resources */
 	UnmapViewOfFile((LPVOID)d->queue);
@@ -545,19 +528,19 @@ int mq_close(mqd_t mqdes)
 	 * aren't currently being used by other threads.
 	 */
 	if (d->next)
-		EnterCriticalSection(&d->next->private_lock);
+		mqd_private_lock((void*)&d->next);
 
 	if (d->prev)
-		EnterCriticalSection(&d->prev->private_lock);
+		mqd_private_lock((void*)&d->prev);
 
 	if (d->next) {
 		d->next->prev = d->prev;
-		LeaveCriticalSection(&d->next->private_lock);
+		mqd_private_unlock((void*)&d->next);
 	}
 
 	if (d->prev) {
 		d->prev->next = d->next;
-		LeaveCriticalSection(&d->prev->private_lock);
+		mqd_private_unlock((void*)&d->prev);
 	}
 
 	/*
@@ -565,20 +548,21 @@ int mq_close(mqd_t mqdes)
 	 * after the table's lock is owned.
 	 */
 	if (mqdtab->free_mqd.tail) {
-		mqdtab->free_mqd.tail->next = d;
+		mqdtab->free_mqd.tail->next = (void*)d;
 		d->prev = mqdtab->free_mqd.tail;
-		mqdtab->free_mqd.tail = d;
+		mqdtab->free_mqd.tail = (void*)d;
 		d->next = NULL;
 	} else {
-		mqdtab->free_mqd.tail = mqdtab->free_mqd.head = d;
+		mqdtab->free_mqd.tail = mqdtab->free_mqd.head = (void*)d;
 		d->next = d->prev = NULL;
 	}
 
 	/* finally destroy the queue's lock and release the table's lock */
-	DeleteCriticalSection(&d->private_lock);
+	mqd_destroy_private_lock(d);
+	err = 0;
 out:
 	LeaveCriticalSection(&mqdtab->lock);
-	return 0;
+	return err;
 }
 
 #if 0
@@ -637,7 +621,7 @@ mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 		return -1;
 	}
 
-	d = mqdtable_get_and_lock_mqd(des);
+	d = get_and_lock_mqd(des);
 
 	if (d == NULL) {
 		errno = EBADF;
@@ -734,7 +718,7 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 	int res = 0;
 	long curmsg;
 
-	d = mqdtable_get_and_lock_mqd(des);
+	d = get_and_lock_mqd(des);
 
 	if (d == NULL) {
 		errno = EBADF;
@@ -743,19 +727,18 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 
 	q = d->queue;
 
-	/* msg_size <= to mq_msgsize */
+	/* validate parameters */
 	if (msg_size > d->attr.mq_msgsize) {
 		errno = EMSGSIZE;
 		goto bad;
 	}
 
-	/* 0 <= msg_prio < MQ_PRIO_MAX */
 	if (msg_prio >= MQ_PRIO_MAX || msg_prio < 0) {
 		errno = EINVAL;
 		goto bad;
 	}
 
-	/* fail if cannot be written to */
+	/* Check the queue's permisions */
 	if (!(d->flags & (O_RDWR | O_WRONLY))) {
 		errno = EPERM;
 		goto bad;
@@ -775,9 +758,9 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 			errno = EAGAIN;
 			goto bad;
 		} else do {
-				mqd_unlock(d);
-				Sleep(d->attr.mq_sleepdur);
-				mqd_lock(d);
+			mqd_unlock(d);
+			Sleep(d->attr.mq_sleepdur);
+			mqd_lock(d);
 		} while (q->curmsg == d->attr.mq_maxmsg);
 	}
 
@@ -816,3 +799,4 @@ int mq_unlink(const char *name)
 	errno = ENOSYS;
 	return -1;
 }
+
