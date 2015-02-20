@@ -65,11 +65,7 @@ static int mq_wait_handle(HANDLE h)
 
 static int mqd_get_lock(volatile struct mqd *d)
 {
-	if (!(d->flags & O_PRIVATE) && mq_wait_handle(d->mutex)) {
-		return -1;
-	}
-
-	return 0;
+	return mq_wait_handle(d->mutex);
 }
 
 static volatile struct mqd *get_and_lock_mqd(mqd_t mqdes)
