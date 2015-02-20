@@ -801,8 +801,24 @@ received:
 		next->prev = -1;
 		q->prio_head[prio] = m->next;
 	} else {
+		int i, empty = 1;
+
+		mq_cond_unset(d->not_empty_prio[prio]);
 		q->prio_head[prio] = -1;
 		q->prio_tail[prio] = -1;
+
+		for (i = 0; i < MQ_PRIO_MAX; ++i) {
+			if (q->prio_head[prio] != -1)
+				empty = 0;
+		}
+
+		if (empty)
+			mq_cond_unset(d->not_empty);
+
+	}
+
+	if (q->curmsg == q->maxmsg - 1) {
+		mq_cond_set(d->not_full);
 	}
 
 	err = 0;
@@ -893,6 +909,7 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 	/* Put the new message in the queue. Ignore value of m->prev */
 	m->prev = q->prio_tail[msg_prio];
 	q->prio_tail[msg_prio] = prev->next = q->free_head;
+
 	/* check if the queue can hold more messages */
 	if (m->next == -1) {
 		q->free_head = q->free_tail = -1;
@@ -903,8 +920,12 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 
 	m->next = -1;
 	d->attr.mq_curmsg = ++q->curmsg;
-	if (q->curmsg == 1)
+
+	/* signal that the queue is not empty */
+	if (q->curmsg == 1) {
 		mq_cond_set(&d->not_empty);
+		mq_cond_set(&d->not_empty_prio[msg_prio]);
+	}
 
 	if (0) {
 bad:
