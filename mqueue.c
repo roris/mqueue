@@ -7,7 +7,7 @@
 #include <string.h>
 #include <wchar.h>
 #include <time.h>
-#include "_mqueue.h"
+#include "mqdefs.h"
 
 #define SIZE_TO_WLEN(s)	((s) / sizeof(wchar_t) - 1)
 #define MQ_MSG_ALIVE	0x1
