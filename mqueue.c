@@ -1,3 +1,4 @@
+#define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #include <errno.h>
 #include <windows.h>
@@ -6,84 +7,36 @@
 #include <string.h>
 #include <wchar.h>
 #include <time.h>
-#include "mqueue.h"
+#include "_mqueue.h"
 
 #define SIZE_TO_WLEN(s)	((s) / sizeof(wchar_t) - 1)
 #define MQ_MSG_ALIVE	0x1
 #define MQ_MQD_ALIVE	0x1
 #define MQ_PREFIX	L"/mq/"
 #define MQ_LOCK_SUFFIX	L".lock"
+#define MQ_FULL_EVENT_SUFFIX	L".1"
+#define MQ_EMPTY_EVENT_SUFFIX	L".0"
 #define MQ_LOCK_LEN	(SIZE_TO_WLEN(sizeof(MQ_LOCK_SUFFIX)))
 #define MQ_PREFIX_LEN	(SIZE_TO_WLEN(sizeof(MQ_PREFIX)))
 #define MQ_NAME_MAX	((MAX_PATH - MQ_LOCK_LEN) - MQ_PREFIX_LEN)
 
-struct message {
-	int	next;		/* index of the next message */
-	int	prev;		/* index of the previous message */
-	short	flags;
-	int	size;
-	char	buffer[1];
-};
-
-struct mqueue {
-	int		curmsg;
-	int		msgsize;	/* sizeof(message) - 1 + msg_size */
-	int		maxmsg;
-	int		free_tail;
-	int		free_head;
-	int		prio_tail[MQ_PRIO_MAX];
-	int		prio_head[MQ_PRIO_MAX];
-	wchar_t		name[MAX_PATH];
-	struct message	buffer[1];
-};
-
-struct mqd {
-	CRITICAL_SECTION	private_lock;
-	HANDLE			mutex;
-	HANDLE		 	map;	/* handle to the shared memory */
-	volatile struct mqueue *queue;
-	struct mqd	       *next;	/* next queue descriptor */
-	struct mqd	       *prev;	/* previous queue descriptor */
-	struct mq_attr		attr;	/* flags for the current queue */
-	int			flags;	/* private flags */
-	int			eflags;	/* extended flags */
-};
-
-struct mqdtable {
-	CRITICAL_SECTION lock;
-	struct mqdtable	*parent;
-	struct {
-		struct mqd	*tail;
-		struct mqd	*head;
-	} free_mqd, live_mqd;
-	int		 curqueues;
-	struct mqd	 desc[MQ_OPEN_MAX];
-};
-
 static struct mqdtable *mqdtab;
 
-static void mqd_destroy_mutex(volatile struct mqd *);
-static void mqd_destroy_private_lock(volatile struct mqd *);
-
-static int mqdtable_init(void)
+static void mqd_destroy_shared_lock(struct mqd *d)
 {
-	if (mqdtab == NULL)
-		mqdtab = calloc(1, sizeof(struct mqdtable));
+	CloseHandle(d->mutex);
+}
 
-	if (mqdtab != NULL) {
-		/* create a lock */
-		int i = 1;
-		InitializeCriticalSection(&mqdtab->lock);
-		EnterCriticalSection(&mqdtab->lock);
-		for(; i < MQ_OPEN_MAX; ++i) {
-			mqdtab->desc[i - 1].next = &mqdtab->desc[i];
-			mqdtab->desc[i].prev = &mqdtab->desc[i - 1];
-		}
-		mqdtab->free_mqd.head = mqdtab->desc;
-		LeaveCriticalSection(&mqdtab->lock);
-		return 0;
-	}
-	return -1;
+static void mqd_destroy_local_lock(struct mqd *d)
+{
+	void *mutex = d->mutex;
+	DeleteCriticalSection(mutex);
+}
+
+static void mqd_destroy_lock(struct mqd *d)
+{
+	if (d->flags & O_PRIVATE) mqd_destroy_local_lock(d);
+	else mqd_destroy_shared_lock(d);
 }
 
 static void mqdtable_lock(void)
@@ -96,12 +49,11 @@ static void mqdtable_unlock(void)
 	LeaveCriticalSection(&mqdtab->lock);
 }
 
-static struct mqd *get_mqd(mqd_t mqdes)
+static volatile struct mqd *get_mqd(mqd_t mqdes)
 {
 	if (mqdes < 0 || mqdes >= MQ_OPEN_MAX)
 		goto bad;
 
-	/* set errno to EBADF? */
 	if (mqdtab->desc[mqdes].eflags & MQ_MQD_ALIVE)
 		return &mqdtab->desc[mqdes];
 
@@ -110,9 +62,9 @@ bad:
 	return NULL;
 }
 
-static int mqd_lock_mutex(volatile struct mqd *d)
+static int mqd_wait_handle(HANDLE h)
 {
-	switch (WaitForSingleObject((void*)d->mutex, INFINITE)) {
+	switch (WaitForSingleObject(h, INFINITE)) {
 	case WAIT_ABANDONED:
 		errno = EBADMSG;
 		return -1;
@@ -123,54 +75,67 @@ static int mqd_lock_mutex(volatile struct mqd *d)
 	return -1;
 }
 
-static void mqd_unlock_mutex(volatile struct mqd *d)
+
+static void mqd_release_shared_lock(volatile struct mqd *d)
 {
 	ReleaseMutex((void*)d->mutex);
 }
 
 
-static void mqd_private_lock(volatile struct mqd *d)
+static void mqd_get_local_lock(volatile struct mqd *d)
 {
 	EnterCriticalSection((void*)&d->private_lock);
 }
 
-static int mqd_lock(volatile struct mqd *d)
+static int mqd_get_lock(volatile struct mqd *d)
 {
-	mqd_private_lock(d);
-	mqd_lock_mutex(d);
+	if (!(d->flags & O_PRIVATE) && mqd_wait_handle(d->mutex)) {
+		return -1;
+	}
+
+	if (d->flags & O_PRIVATE)
+		mqd_get_local_lock(d);
+
 	return 0;
 }
 
-static struct mqd *get_and_lock_mqd(mqd_t mqdes)
+static volatile struct mqd *get_and_lock_mqd(mqd_t mqdes)
 {
 	/* assume that mqdtab is never NULL */
-	struct mqd *res;
+	volatile struct mqd *res;
 
 	mqdtable_lock();
 
 	res = get_mqd(mqdes);
 
 	if(res != NULL)
-		mqd_lock(res);
+		mqd_get_lock(res);
 
 	mqdtable_unlock();
 
 	return res;
 }
 
-static void mqd_unlock(volatile struct mqd *d)
+static void mqd_release_local_lock(volatile struct mqd *d)
 {
-	mqd_private_unlock(d);
-	mqd_unlock_mutex(d);
+	LeaveCriticalSection((void*)&d->private_lock);
 }
 
-static void mqd_create_private_lock(volatile struct mqd *d)
+static void mqd_release_lock(volatile struct mqd *d)
+{
+	if (d->flags & O_PRIVATE)
+		mqd_release_shared_lock(d);
+	else
+		DeleteCriticalSection(d->mutex);
+}
+
+static void mqd_create_local_lock(volatile struct mqd *d)
 {
 	InitializeCriticalSection((void*)&d->private_lock);
 }
 
 /* ASSUME: descriptor is for a public queue. */
-static int mqd_create_and_lock_mutex(struct mqd *d, wchar_t *name)
+static int mqd_create_and_get_lock(struct mqd *d, wchar_t *name)
 {
 	int err;
 	int flags = d->flags;
@@ -188,7 +153,7 @@ static int mqd_create_and_lock_mutex(struct mqd *d, wchar_t *name)
 			/* Signal the mutex. Errno will get changed on
 			 * failure which is OK.
 			 */
-			mqd_lock_mutex(d);
+			mqd_wait_handle(d);
 			return -1;
 		}
 
@@ -209,7 +174,7 @@ open_mutex:
 		 * FIXME: handle wait failure.
 		 */
 		if (d->mutex != NULL)
-			return mqd_lock_mutex(d);
+			return mqd_wait_handle(d);
 
 		/* mutex is null, check last and set ENOENT, if the
 		 * mutex does not exist.
@@ -301,19 +266,136 @@ static int valid_open_attr(struct mq_attr *a)
 	return a->mq_maxmsg > 0 && a->mq_msgsize > 0 && a->mq_sleepdur > 0;
 }
 
+static void mqd_destroy_shared_cond(struct mqd *d)
+{
+	int i = 0;
+	for (; i < MQ_PRIO_MAX + 1; ++i) {
+		/* threads waiting for a message slot */
+		SetEvent(&d->cond[MQ_PRIO_MAX][0].shared);
+		CloseHandle(&d->cond[MQ_PRIO_MAX][0].shared);
+		d->cond[i][0].shared = NULL;
+
+		/* threads waiting for a message */
+		SetEvent(&d->cond[i][1].shared);
+		CloseHandle(&d->cond[i][1].shared);
+		d->cond[i][1].shared = NULL;
+	}
+}
+
+static HANDLE do_mqd_create_shared_cond(struct mqd *d, wchar_t *name,
+	DWORD *err)
+{
+	HANDLE v = CreateEventW(NULL, FALSE, TRUE, name);
+
+	*err = GetLastError();
+	if (*err == ERROR_ALREADY_EXISTS) {
+		if (d->flags & O_EXCL) {
+			CloseHandle(v);
+			v = NULL;
+		}
+		errno = EEXIST;
+		d->flags &= ~O_CREAT;
+	} else if (v == NULL) {
+		errno = EOTHER;
+	}
+
+	return v;
+}
+
+static int mqd_create_shared_cond(struct mqd *d, wchar_t *empty,
+	wchar_t *full)
+{
+	DWORD err;
+	int i, j;
+
+	for (i = 0; i <= MQ_PRIO_MAX; ++i) {
+		d->cond[i][0].shared = do_mqd_create_shared_cond(d, empty, &err);
+		if (d->cond[i][0].shared == NULL) {
+			goto bad;
+		}
+	}
+
+	for (j = 0; j <= MQ_PRIO_MAX; ++j) {
+		d->cond[j][1].shared = do_mqd_create_shared_cond(d, full, &err);
+
+		if (d->cond[j][1].shared == NULL) {
+			for (--j; j >= 0; --j)
+				CloseHandle(d->cond[j][0].shared);
+		bad:
+			for (--i; i >= 0; --i)
+				CloseHandle(d->cond[j][0].shared);
+
+			SetLastError(err);
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static void mqd_create_local_cond(struct mqd *d)
+{
+	int i, j;
+	for (i = 0; i <= MQ_PRIO_MAX; ++i) {
+		d->cond[i][0].local = malloc(sizeof(CONDITION_VARIABLE));
+		InitializeConditionVariable(d->cond[i][0].local);
+	}
+	for (j = 0; j <= MQ_PRIO_MAX; ++j) {
+		d->cond[j][1].local = malloc(sizeof(CONDITION_VARIABLE));
+		InitializeConditionVariable(d->cond[j][0].local);
+	}
+}
+ 
+static void mqd_destroy_local_cond(struct mqd *d)
+{
+	int i = 0;
+	for (; i >= 0; --i) {
+		free(d->cond[i][0].local);
+		free(d->cond[i][1].local);
+		d->cond[i][0].local = NULL;
+		d->cond[i][1].local = NULL;
+	}
+}
+
+static int mqd_create_cond(struct mqd *d, wchar_t *empty, wchar_t *full)
+{
+	if (d->flags & O_PRIVATE) {
+		mqd_create_local_cond(d);
+		return 0;
+	}
+	return mqd_create_shared_cond(d, empty, full);
+}
+
+static void mqd_destroy_cond(struct mqd *d)
+{
+	if (d->flags & O_PRIVATE)
+		mqd_destroy_local_cond(d);
+	else
+		mqd_destroy_shared_cond(d);
+}
+
 mqd_t mq_open(const char *name, int oflag, ...)
 {
 	va_list al;
-	struct mqd d;	/* temporary */
+	struct mqd d;
 	volatile struct mqd *qd;
 	struct mqueue *mq;
 	HANDLE *map;
-	wchar_t *mqname, *lkname, *wname;
+	wchar_t *mqname, *lkname, *wname, *cvfull, *cvempty;
+	/* TODO: do not use this many buffers. */
 	wchar_t lkname_[MAX_PATH], mqname_[MAX_PATH];
+	wchar_t cvfull_[MAX_PATH], cvempty_[MAX_PATH];
 	DWORD err, mapacc;
 	int res, private;
 
 	private = oflag & O_PRIVATE;
+
+	mqdtable_lock();
+
+	if ((qd = mqdtab->free_mqd.head) == NULL) {
+		errno = EMFILE;
+		goto close_map;
+	}
 
 	/* convert the name to unicode */
 	wname = inflate(name, MQ_NAME_MAX);
@@ -321,27 +403,38 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		errno = ENAMETOOLONG;
 		return -1;
 	}
+
 	wcscpy(mqname_, MQ_PREFIX);
 	wcscat(mqname_, wname);
-
-	/* Only copy for public names */
-	if (!private) {
-		wcscpy(lkname_, wname);
-		wcscat(lkname_, MQ_LOCK_SUFFIX);
-	}
 
 	if (private) {
 		lkname = mqname = NULL;
 	} else {
+		wcscpy(lkname_, mqname_);
+		wcscat(lkname_, MQ_LOCK_SUFFIX);
+		wcscpy(cvfull_, mqname_);
+		wcscat(cvfull_, MQ_FULL_EVENT_SUFFIX);
+		wcscpy(cvempty_, mqname_);
+		wcscat(cvfull_, MQ_EMPTY_EVENT_SUFFIX);
+
 		lkname = lkname_;
 		mqname = mqname_;
+		cvfull = cvfull_;
+		cvempty = cvempty_;
 	}
+
 	free(wname);
-
 	memset(&d, 0, sizeof(d));
+	d.flags = oflag;
 
-	/* If public, try to lock the queue first. */
-	if (!private && mqd_create_and_lock_mutex(&d, lkname)) {
+	/* create the muteces */
+	if(mqd_create_and_get_lock(&d, lkname)) {
+		if ((errno == EEXIST && oflag & O_EXCL) || errno == EOTHER)
+			return -1;
+	}
+
+	/* create condition variables. */
+	if (mqd_create_cond(&d, cvempty, cvfull)) {
 		if ((errno == EEXIST && oflag & O_EXCL) || errno == EOTHER)
 			return -1;
 	}
@@ -359,7 +452,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		break;
 	default:
 		errno = EINVAL;
-		goto destroy_lock;
+		goto destroy_cond;
 	}
 
 	/* map the page file */
@@ -456,36 +549,42 @@ copy_open:
 	d.flags = oflag;
 	d.eflags = MQ_MQD_ALIVE;
 
-	mqdtable_lock();
-	qd = mqdtab->free_mqd.head;
-
-	if (!qd) {
-		errno = EMFILE;
-		goto close_map;
-	}
-
-	/* remove from free list */
+	/* Since the table is locked here, it is not necessary to lock the
+	 * other queue descriptors
+	 */
 	if (qd->next) qd->next->prev = NULL;
 	else mqdtab->free_mqd.tail = NULL;
 	mqdtab->free_mqd.head = qd->next;
 
-	/* move to live list */
 	qd->prev = mqdtab->live_mqd.tail;
 	if (qd->prev) qd->prev->next = (void*)qd;
 	else mqdtab->live_mqd.tail = mqdtab->live_mqd.head = (void*)qd;
+
 	qd->next = NULL;
-	mqd_create_private_lock(&d);
 	*qd = d;
 
-	/* release the lock */
-	if (!private)
-		mqd_unlock_mutex(qd);
+	if (d.flags & O_CREAT) {
+		int i = 0;
+
+		/* 
+		 * Signal that the queue is empty. Although no threads should
+		 * be waiting on the condition variable, it is safer to set 
+		 * them here. Infact, no thread would be able to wait on the
+		 * variable since the queue is locked.
+		 */
+		for (; i <= MQ_PRIO_MAX; ++i)
+			mq_cond_set(&d.cond[i][0]);
+	}
+
+	mqd_release_lock(&d);
 
 	if (0) {
 close_map:
 		CloseHandle(map);
+destroy_cond:
+		mqd_destroy_local_cond(&d);
 destroy_lock:
-		mqd_destroy_mutex(&d);
+		mqd_destroy_lock(&d);
 		res = -1;
 	}
 
@@ -514,7 +613,7 @@ int mq_close(mqd_t mqdes)
 	 * public lock as the queue itself is not altered. No need to unlock
 	 * the private lock.
 	 */
-	mqd_private_lock(d);
+	mqd_get_local_lock(d);
 	d->flags &= ~MQ_MQD_ALIVE;
 
 	/* free resources */
@@ -528,19 +627,19 @@ int mq_close(mqd_t mqdes)
 	 * aren't currently being used by other threads.
 	 */
 	if (d->next)
-		mqd_private_lock((void*)&d->next);
+		mqd_get_local_lock((void*)&d->next);
 
 	if (d->prev)
-		mqd_private_lock((void*)&d->prev);
+		mqd_get_local_lock((void*)&d->prev);
 
 	if (d->next) {
 		d->next->prev = d->prev;
-		mqd_private_unlock((void*)&d->next);
+		mqd_release_local_lock((void*)&d->next);
 	}
 
 	if (d->prev) {
 		d->prev->next = d->next;
-		mqd_private_unlock((void*)&d->prev);
+		mqd_release_local_lock((void*)&d->prev);
 	}
 
 	/*
@@ -558,7 +657,7 @@ int mq_close(mqd_t mqdes)
 	}
 
 	/* finally destroy the queue's lock and release the table's lock */
-	mqd_destroy_private_lock(d);
+	mqd_destroy_lock(d);
 	err = 0;
 out:
 	LeaveCriticalSection(&mqdtab->lock);
@@ -611,7 +710,7 @@ DWORD mqd_find_next_msg(struct mqd *d)
 int
 mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 {
-	struct mqd *d;
+	volatile struct mqd *d;
 	volatile struct mqueue *q;
 	struct message *m, *next, *tail;
 	int err, prio, startprio, minprio, nonblock;
@@ -646,24 +745,46 @@ mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 		startprio = MQ_PRIO_MAX - 1;
 	}
 
-	nonblock = d->attr.mq_flags & O_NONBLOCK;
-	while (1) {
-		for (prio = startprio; prio >= minprio; --prio) {
-			if (q->prio_head[prio] != -1) {
-				m = mqueue_get_msg(q, q->prio_head[prio]);
-				goto received;
-			}
+	for (prio = startprio; prio >= minprio; --prio) {
+		if (q->prio_head[prio] != -1) {
+			m = mqueue_get_msg(q, q->prio_head[prio]);
+			goto received;
 		}
-
-		if (nonblock) {
-			errno = EAGAIN;
-			goto bad;
-		}
-
-		mqd_unlock(d);
-		Sleep(d->attr.mq_sleepdur);
-		mqd_lock(d);
 	}
+
+	/* no message was recieved. */
+	if (d->attr.mq_flags & O_NONBLOCK) {
+		errno = EAGAIN;
+		goto bad;
+	} else do {
+		mqd_release_lock(d);
+
+		/* prio should be valid at this point. */
+		if (msg_prio) {
+			mq_cond_wait(&d->cond[*msg_prio][1]);
+		} else {
+			mq_cond_wait(&d->cond[MQ_PRIO_MAX][1]);
+		}
+
+		/* Check if the descriptor is still valid. */
+		d = get_and_lock_mqd(des);
+		if(d == NULL)
+			return -1;
+
+		/* It shouldn't fail at this point. */
+		for (prio = startprio; prio >= minprio; --prio) {
+			m = mqueue_get_msg(d->queue, d->queue->prio_head[prio]);
+			if (m != NULL)
+				goto received;
+		}
+		/* loop if failed, and O_NONBLOCK wasn't  set for the 
+		 * descriptor by another thread.
+		 */
+	} while (!(d->attr.mq_flags & O_NONBLOCK));
+
+	/* O_NONBLOCK was set, and no message was recieved. */
+	errno = EAGAIN;
+	return -1;
 
 received:
 	if (m->size > msg_size) {
@@ -705,13 +826,13 @@ bad:
 		err = -1;
 	}
 
-	mqd_unlock(d);
+	mqd_release_lock(d);
 	return err;
 }
 
 int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 {
-	struct mqd *d;
+	volatile struct mqd *d;
 	volatile struct mqueue *q;
 	struct message *prev;
 	struct message *m;
@@ -745,31 +866,28 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 	}
 
 	curmsg = q->curmsg;
-#if MQ_PARANOID
 	/* If q->curmsg > MQ_MAX_MSG, then the queue is invalid */
 	if (curmsg > d->attr.mq_maxmsg) {
 		errno = EBADMSG;
 		goto bad;
 	}
-#endif
 
 	if (curmsg == d->attr.mq_maxmsg) {
 		if (d->flags & O_NONBLOCK) {
 			errno = EAGAIN;
 			goto bad;
 		} else do {
-			mqd_unlock(d);
+			mqd_release_lock(d);
 			Sleep(d->attr.mq_sleepdur);
-			mqd_lock(d);
+			d = get_mqd(des);
+			mqd_get_lock(d);
 		} while (q->curmsg == d->attr.mq_maxmsg);
 	}
 
-#if MQ_PARANOID
 	if (q->curmsg > d->attr.mq_maxmsg) {
 		errno = EBADMSG;
 		goto bad;
 	}
-#endif
 
 	/* create the message */
 	m = mqueue_get_msg(q, q->free_head);
@@ -790,7 +908,7 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 bad:
 		res = -1;
 	}
-	mqd_unlock(d);
+	mqd_release_lock(d);
 	return res;
 }
 
@@ -800,3 +918,34 @@ int mq_unlink(const char *name)
 	return -1;
 }
 
+static int mqdtable_init(void)
+{
+	if (mqdtab == NULL)
+		mqdtab = calloc(1, sizeof(struct mqdtable));
+
+	if (mqdtab != NULL) {
+		/* create a lock */
+		int i = 1;
+		InitializeCriticalSection(&mqdtab->lock);
+		EnterCriticalSection(&mqdtab->lock);
+		for (; i < MQ_OPEN_MAX; ++i) {
+			mqdtab->desc[i - 1].next = &mqdtab->desc[i];
+			mqdtab->desc[i].prev = &mqdtab->desc[i - 1];
+		}
+		mqdtab->free_mqd.head = mqdtab->desc;
+		LeaveCriticalSection(&mqdtab->lock);
+		return 0;
+	}
+	return -1;
+}
+
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD fdwReason, LPVOID reserved)
+{
+	switch (fdwReason) {
+	case DLL_PROCESS_ATTACH:
+		if (mqdtable_init())
+			return FALSE;
+		break;
+	}
+	return TRUE;
+}
