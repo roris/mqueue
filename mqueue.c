@@ -65,7 +65,7 @@ static int mq_wait_handle(HANDLE h)
 
 static int mqd_get_lock(volatile struct mqd *d)
 {
-	if (!(d->flags & O_PRIVATE) && mqd_wait_handle(d->mutex)) {
+	if (!(d->flags & O_PRIVATE) && mq_wait_handle(d->mutex)) {
 		return -1;
 	}
 
@@ -133,7 +133,7 @@ open_mutex:
 		 * FIXME: handle wait failure.
 		 */
 		if (d->mutex != NULL)
-			return mqd_wait_handle(d->mutex);
+			return mq_wait_handle(d->mutex);
 
 		/* mutex is null, check last and set ENOENT, if the
 		 * mutex does not exist.
@@ -186,7 +186,7 @@ void create_secdesc(mode_t mode)
 }
 #endif
 
-WCHAR *inflate(const char *src, DWORD maxsize)
+static WCHAR *inflate(const char *src, DWORD maxsize)
 {
 	WCHAR *tmp;
 	DWORD tmpsize;
@@ -274,16 +274,26 @@ static int mqd_create_cond(struct mqd *d, wchar_t *empty, wchar_t *full)
 	return 0;
 }
 
+static int mq_cond_set(HANDLE cond)
+{
+	if(!SetEvent(cond)) {
+		errno = EOTHER;
+		return -1;
+	}
+	return 0;
+}
+
 static void mqd_destroy_cond(struct mqd *d)
 {
 	int i;
-	mqd_set_cond(d->not_full);
+	/* ignore failure at this point, for now. */
+	mq_cond_set(d->not_full);
 	CloseHandle(d->not_full);
-	mqd_set_cond(d->not_empty);
+	mq_cond_set(d->not_empty);
 	CloseHandle(d->not_empty);
 
 	for (i = 0; i < MQ_PRIO_MAX; ++i) {
-		mqd_set_cond(d->not_empty_prio[i]);
+		mq_cond_set(d->not_empty_prio[i]);
 		CloseHandle(d->not_empty_prio[i]);
 	}
 }
@@ -603,6 +613,15 @@ DWORD mqd_find_next_msg(struct mqd *d)
 }
 #endif
 
+int mq_cond_unset(HANDLE cond)
+{
+	if (!ResetEvent) {
+		errno = EOTHER;
+		return -1;
+	}
+	return 0;
+}
+
 int
 mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 {
@@ -657,9 +676,12 @@ mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 
 		/* prio should be valid at this point. */
 		if (msg_prio) {
-
+			/* XXX: Should a priority slot be signaled when a
+			 * messsage gets queued onto a lesser priority slot?
+			 */
+			mq_wait_handle(d->not_empty_prio[prio]);
 		} else {
-			mq_cond_wait(&d->not_empty);
+			mq_wait_handle(d->not_empty);
 		}
 
 		/* Check if the descriptor is still valid. */
@@ -785,7 +807,7 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 			goto bad;
 		} else do {
 			mqd_release_lock(d);
-			mq_cond_wait(&d->not_full);
+			mq_wait_handle(&d->not_full);
 			d = get_mqd(des);
 			mqd_get_lock(d);
 		} while (!(d->flags & O_NONBLOCK));
