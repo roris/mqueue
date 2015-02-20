@@ -315,20 +315,21 @@ mqd_t mq_open(const char *name, int oflag, ...)
 	DWORD err, mapacc;
 	int res, private;
 
+	res = -1;
 	private = oflag & O_PRIVATE;
 
 	mqdtable_lock();
 
-	if ((qd = mqdtab->free_mqd.head) == NULL) {
+	if (mqtab->curopen == MQ_OPEN_MAX) {
 		errno = EMFILE;
-		goto close_map;
+		goto unlock_table;
 	}
 
 	/* convert the name to unicode */
 	wname = inflate(name, MQ_NAME_MAX);
 	if (wname == NULL) {
 		errno = ENAMETOOLONG;
-		return -1;
+		goto unlock_table;
 	}
 
 	wcscpy(mqname_, MQ_PREFIX);
@@ -357,13 +358,13 @@ mqd_t mq_open(const char *name, int oflag, ...)
 	/* create the muteces */
 	if(mqd_create_and_get_lock(&d, lkname)) {
 		if ((errno == EEXIST && oflag & O_EXCL) || errno == EOTHER)
-			return -1;
+			goto unlock_table;
 	}
 
 	/* create condition variables. */
 	if (mqd_create_cond(&d, cvempty, cvfull)) {
 		if ((errno == EEXIST && oflag & O_EXCL) || errno == EOTHER)
-			return -1;
+			goto unlock_table;
 	}
 
 	mapacc = 0;
@@ -416,15 +417,13 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
 					 PAGE_READWRITE, 0, mapsize, mqname);
 
-		err = GetLastError();
-
 		if (map == NULL) {
 			/* let the application handle failure :) */
-			SetLastError(err);
 			errno = EOTHER;
 			goto destroy_lock;
 		}
 
+		err = GetLastError();
 		if (err == ERROR_ALREADY_EXISTS) {
 			if (oflag & O_EXCL) {
 				errno = EEXIST;
@@ -434,7 +433,6 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		}
 
 		mq = MapViewOfFile(map, mapacc, 0, 0, 0);
-
 		if (mq == NULL) {
 			errno = EOTHER;
 			goto close_map;
@@ -452,7 +450,6 @@ mqd_t mq_open(const char *name, int oflag, ...)
 
 		for (i = 0; i < MQ_PRIO_MAX; ++i)
 			mq->prio_head[i] = mq->prio_tail[i] = -1;
-
 		mqueue_get_msg(mq, d.attr.mq_maxmsg - 1)->next = -1;
 	} else {
 		map = OpenFileMappingW(mapacc, 0, mqname);
@@ -489,6 +486,7 @@ copy_open:
 
 	qd->next = NULL;
 	*qd = d;
+	mqdtab->curopen++;
 
 	mqd_release_lock(&d);
 
@@ -501,7 +499,7 @@ destroy_lock:
 		mqd_destroy_lock(&d);
 		res = -1;
 	}
-
+unlock_table:
 	mqdtable_unlock();
 
 	return res;
@@ -553,6 +551,7 @@ int mq_close(mqd_t mqdes)
 	}
 
 	/* finally destroy the queue's lock and release the table's lock */
+	--mqtdtab->curopen;
 	mqd_destroy_lock(d);
 	err = 0;
 out:

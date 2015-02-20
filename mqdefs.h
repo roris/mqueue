@@ -40,6 +40,6 @@ struct mqdtable {
 		struct mqd	*tail;
 		struct mqd	*head;
 	} free_mqd, live_mqd;
-	int		 	 curqueues;
+	int		 	 curopen;
 	struct mqd	 	 desc[MQ_OPEN_MAX];
 };
