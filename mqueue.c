@@ -222,48 +222,55 @@ static int valid_open_attr(struct mq_attr *a)
 }
 
 static HANDLE do_mqd_create_cond(struct mqd *d, wchar_t *name,
-	DWORD *err)
+	BOOL signaled)
 {
-	HANDLE v = CreateEventW(NULL, FALSE, TRUE, name);
+	HANDLE res;
+	DWORD err;
 
-	*err = GetLastError();
-	if (*err == ERROR_ALREADY_EXISTS) {
-		if (d->flags & O_EXCL) {
-			CloseHandle(v);
-			v = NULL;
+	if (d->flags & O_CREAT) {
+		res = CreateEventW(NULL, TRUE, signaled, name);
+		err = GetLastError();
+		if (err == ERROR_ALREADY_EXISTS) {
+			if (d->flags & O_EXCL) {
+				CloseHandle(res);
+				res = NULL;
+			}
+			errno = EEXIST;
+			d->flags &= ~O_CREAT;
+		} else if (res == NULL) {
+			SetLastError(err);
+			errno = EOTHER;
 		}
-		errno = EEXIST;
-		d->flags &= ~O_CREAT;
-	} else if (v == NULL) {
-		errno = EOTHER;
+	} else {
+		res = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
+		if (res == NULL) {
+			errno = EOTHER;
+		}
 	}
 
-	return v;
+	return res;
 }
 
 static int mqd_create_cond(struct mqd *d, wchar_t *empty, wchar_t *full)
 {
-	DWORD err;
 	int i, j;
 
-	d->not_full = do_mqd_create_cond(d, full, &err);
+	d->not_full = do_mqd_create_cond(d, full, TRUE);
 	if (d->not_full == NULL)
 		goto set_err;
 
-	d->not_empty = do_mqd_create_cond(d, empty, &err);
+	d->not_empty = do_mqd_create_cond(d, empty, FALSE);
 	if (d->not_empty = NULL)
 		goto close_not_full;
 
 	for (i = 0; i <= MQ_PRIO_MAX; ++i) {
-		d->not_empty_prio[i] = do_mqd_create_cond(d, empty, &err);
+		d->not_empty_prio[i] = do_mqd_create_cond(d, empty, FALSE);
 		if (d->not_empty_prio[i] == NULL) {
 			for (--i; i >= 0; --i)
 				CloseHandle(d->not_empty_prio[i]);
 			CloseHandle(d->not_empty);
 		close_not_full:
 			CloseHandle(d->not_full);
-		set_err:
-			SetLastError(err);
 			return -1;
 		}
 	}
@@ -482,19 +489,6 @@ copy_open:
 
 	qd->next = NULL;
 	*qd = d;
-
-	if (d.flags & O_CREAT) {
-		int i = 0;
-
-		/*
-		 * Signal that the queue is not full. Although no threads
-		 * should be waiting on the condition variable, it is safer
-		 * to set them here. Infact, no thread would be able to wait
-		 * on the variable since the queue is locked.
-		 */
-		for (; i <= MQ_PRIO_MAX; ++i)
-			mq_cond_set(d.not_full);
-	}
 
 	mqd_release_lock(&d);
 
