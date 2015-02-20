@@ -345,7 +345,7 @@ static void mqd_create_local_cond(struct mqd *d)
 		InitializeConditionVariable(d->cond[j][0].local);
 	}
 }
- 
+
 static void mqd_destroy_local_cond(struct mqd *d)
 {
 	int i = 0;
@@ -566,11 +566,11 @@ copy_open:
 	if (d.flags & O_CREAT) {
 		int i = 0;
 
-		/* 
-		 * Signal that the queue is empty. Although no threads should
-		 * be waiting on the condition variable, it is safer to set 
-		 * them here. Infact, no thread would be able to wait on the
-		 * variable since the queue is locked.
+		/*
+		 * Signal that the queue is not full. Although no threads
+		 * should be waiting on the condition variable, it is safer
+		 * to set them here. Infact, no thread would be able to wait
+		 * on the variable since the queue is locked.
 		 */
 		for (; i <= MQ_PRIO_MAX; ++i)
 			mq_cond_set(&d.cond[i][0]);
@@ -777,7 +777,7 @@ mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 			if (m != NULL)
 				goto received;
 		}
-		/* loop if failed, and O_NONBLOCK wasn't  set for the 
+		/* loop if failed, and O_NONBLOCK wasn't  set for the
 		 * descriptor by another thread.
 		 */
 	} while (!(d->attr.mq_flags & O_NONBLOCK));
@@ -832,12 +832,16 @@ bad:
 
 int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 {
-	volatile struct mqd *d;
-	volatile struct mqueue *q;
+	struct mqd *d;
+	struct mqueue *q;
 	struct message *prev;
 	struct message *m;
 	int res = 0;
-	long curmsg;
+
+	if (msg_prio >= MQ_PRIO_MAX || msg_prio < 0) {
+		errno = EINVAL;
+		goto bad;
+	}
 
 	d = get_and_lock_mqd(des);
 
@@ -846,16 +850,13 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 		return -1;
 	}
 
-	q = d->queue;
+	/* discard volatile qualifier, as the queue will not be modified by
+	 * other threads
+	 */
+	q = (void*)d->queue;
 
-	/* validate parameters */
 	if (msg_size > d->attr.mq_msgsize) {
 		errno = EMSGSIZE;
-		goto bad;
-	}
-
-	if (msg_prio >= MQ_PRIO_MAX || msg_prio < 0) {
-		errno = EINVAL;
 		goto bad;
 	}
 
@@ -865,45 +866,60 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 		goto bad;
 	}
 
-	curmsg = q->curmsg;
 	/* If q->curmsg > MQ_MAX_MSG, then the queue is invalid */
-	if (curmsg > d->attr.mq_maxmsg) {
-		errno = EBADMSG;
-		goto bad;
-	}
-
-	if (curmsg == d->attr.mq_maxmsg) {
-		if (d->flags & O_NONBLOCK) {
-			errno = EAGAIN;
-			goto bad;
-		} else do {
-			mqd_release_lock(d);
-			Sleep(d->attr.mq_sleepdur);
-			d = get_mqd(des);
-			mqd_get_lock(d);
-		} while (q->curmsg == d->attr.mq_maxmsg);
-	}
-
 	if (q->curmsg > d->attr.mq_maxmsg) {
 		errno = EBADMSG;
 		goto bad;
 	}
 
+	if (q->curmsg == d->attr.mq_maxmsg) {
+		if (d->flags & O_NONBLOCK) {
+			errno = EAGAIN;
+			goto bad;
+		} else do {
+			mqd_release_lock(d);
+			mq_cond_wait(&d->not_full);
+			d = get_mqd(des);
+			mqd_get_lock(d);
+		} while (!(d->flags & O_NONBLOCK));
+
+		q = (void*)d->queue;
+
+		/* O_NONBLOCK was set. */
+		if (q->curmsg == d->attr.mq_maxmsg) {
+
+		}
+
+		if (q->curmsg > d->attr.mq_maxmsg) {
+			errno = EBADMSG;
+			goto bad;
+		}
+	}
+
 	/* create the message */
 	m = mqueue_get_msg(q, q->free_head);
+
 	m->size = msg_size;
 	m->flags = MQ_MSG_ALIVE;
 	memcpy(m->buffer, msg_ptr, msg_size);
 
-	/* put the new message in the queue */
-	m->prev = q->prio_tail[msg_prio];
 	prev = mqueue_get_msg(q, q->prio_tail[msg_prio]);
+	/* Put the new message in the queue. Ignore value of m->prev */
+	m->prev = q->prio_tail[msg_prio];
 	q->prio_tail[msg_prio] = prev->next = q->free_head;
-	q->free_head = m->next;
+	/* check if the queue can hold more messages */
+	if (m->next == -1) {
+		q->free_head = q->free_tail = -1;
+		mq_cond_unset(&d->not_full);
+	} else {
+		q->free_head = m->next;
+	}
 
-	/* XXX: make next point to the next highest priority message? */
 	m->next = -1;
 	d->attr.mq_curmsg = ++q->curmsg;
+	if (q->curmsg == 1)
+		mq_cond_set(&d->not_empty);
+
 	if (0) {
 bad:
 		res = -1;
