@@ -50,7 +50,7 @@ bad:
 	return NULL;
 }
 
-static int mqd_wait_handle(HANDLE h)
+static int mq_wait_handle(HANDLE h)
 {
 	switch (WaitForSingleObject(h, INFINITE)) {
 	case WAIT_ABANDONED:
@@ -112,7 +112,7 @@ static int mqd_create_and_get_lock(struct mqd *d, wchar_t *name)
 			/* Signal the mutex. Errno will get changed on
 			 * failure which is OK.
 			 */
-			mqd_wait_handle(d);
+			mq_wait_handle(d->mutex);
 			return -1;
 		}
 
@@ -133,7 +133,7 @@ open_mutex:
 		 * FIXME: handle wait failure.
 		 */
 		if (d->mutex != NULL)
-			return mqd_wait_handle(d);
+			return mqd_wait_handle(d->mutex);
 
 		/* mutex is null, check last and set ENOENT, if the
 		 * mutex does not exist.
@@ -255,46 +255,36 @@ static int mqd_create_cond(struct mqd *d, wchar_t *empty, wchar_t *full)
 		goto set_err;
 
 	d->not_empty = do_mqd_create_cond(d, empty, &err);
+	if (d->not_empty = NULL)
+		goto close_not_full;
 
 	for (i = 0; i <= MQ_PRIO_MAX; ++i) {
 		d->not_empty_prio[i] = do_mqd_create_cond(d, empty, &err);
-		if (d->cond[i] == NULL) {
+		if (d->not_empty_prio[i] == NULL) {
 			for (--i; i >= 0; --i)
-				CloseHandle(d->cond[j][0].shared);
+				CloseHandle(d->not_empty_prio[i]);
 			CloseHandle(d->not_empty);
+		close_not_full:
 			CloseHandle(d->not_full);
 		set_err:
 			SetLastError(err);
 			return -1;
 		}
 	}
-
-	for (j = 0; j <= MQ_PRIO_MAX; ++j) {
-		d->cond[j][1].shared = do_mqd_create_cond(d, full, &err);
-
-		if (d->cond[j][1].shared == NULL) {
-			for (--j; j >= 0; --j)
-				CloseHandle(d->cond[j][0].shared);
-		bad:
-		}
-	}
-
 	return 0;
 }
 
 static void mqd_destroy_cond(struct mqd *d)
 {
-	int i = 0;
-	for (; i < MQ_PRIO_MAX + 1; ++i) {
-		/* threads waiting for a message slot */
-		SetEvent(&d->cond[MQ_PRIO_MAX][0].shared);
-		CloseHandle(&d->cond[MQ_PRIO_MAX][0].shared);
-		d->cond[i][0].shared = NULL;
+	int i;
+	mqd_set_cond(d->not_full);
+	CloseHandle(d->not_full);
+	mqd_set_cond(d->not_empty);
+	CloseHandle(d->not_empty);
 
-		/* threads waiting for a message */
-		SetEvent(&d->cond[i][1].shared);
-		CloseHandle(&d->cond[i][1].shared);
-		d->cond[i][1].shared = NULL;
+	for (i = 0; i < MQ_PRIO_MAX; ++i) {
+		mqd_set_cond(d->not_empty_prio[i]);
+		CloseHandle(d->not_empty_prio[i]);
 	}
 }
 
@@ -497,7 +487,7 @@ copy_open:
 		 * on the variable since the queue is locked.
 		 */
 		for (; i <= MQ_PRIO_MAX; ++i)
-			mq_cond_set(&d.cond[i][0]);
+			mq_cond_set(d.not_full);
 	}
 
 	mqd_release_lock(&d);
@@ -667,9 +657,9 @@ mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 
 		/* prio should be valid at this point. */
 		if (msg_prio) {
-			mq_cond_wait(&d->cond[*msg_prio][1]);
+
 		} else {
-			mq_cond_wait(&d->cond[MQ_PRIO_MAX][1]);
+			mq_cond_wait(&d->not_empty);
 		}
 
 		/* Check if the descriptor is still valid. */
