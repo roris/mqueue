@@ -559,49 +559,6 @@ out:
 	return err;
 }
 
-#if 0
-DWORD mqd_find_next_msg(struct mqd *d)
-{
-	int i;
-	DWORD j;
-	struct mqueue *q;
-	struct message *m;
-	long curmsg, maxmsg;
-
-	/* queue is full */
-	q = (void *)d->mqd_u.queue;
-	curmsg = q->curmsg;
-	maxmsg = q->maxmsg;
-
-	if (curmsg >= maxmsg)
-		return -1;
-
-	/* an empty queue */
-	if (!curmsg)
-		return 0;
-
-	/* assume free_head contains some message */
-	j = q->free_head;
-	m = mqueue_get_msg(q, j);
-
-	/* free_head is a free msg. This will usually be the case except
-	 * right after a message has been sent/inserted into the queue.
-	 * This function is called to update mqueue->free_head.
-	 */
-	if (!(m->flags & MQ_MSG_ALIVE))
-		return j;
-
-	/* FIXME: only walk the free list */
-	for (i = 1, ++j; i < maxmsg; ++i) {
-		if (!(mqueue_get_msg(q, j)->flags & MQ_MSG_ALIVE))
-			return j;
-		j = (j + 1) % (maxmsg - 1);
-	}
-	/* on the off chance something goes wrong */
-	return -1;
-}
-#endif
-
 int mq_cond_unset(HANDLE cond)
 {
 	if (!ResetEvent) {
