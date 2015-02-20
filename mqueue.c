@@ -622,25 +622,11 @@ int mq_close(mqd_t mqdes)
 	if(!(d->flags & O_PRIVATE))
 		CloseHandle(d->mutex);
 
-	/*
-	 * This is required because there is no guarentee that these mqds
-	 * aren't currently being used by other threads.
-	 */
 	if (d->next)
-		mqd_get_local_lock((void*)&d->next);
+		d->next->prev = d->prev;
 
 	if (d->prev)
-		mqd_get_local_lock((void*)&d->prev);
-
-	if (d->next) {
-		d->next->prev = d->prev;
-		mqd_release_local_lock((void*)&d->next);
-	}
-
-	if (d->prev) {
 		d->prev->next = d->next;
-		mqd_release_local_lock((void*)&d->prev);
-	}
 
 	/*
 	 * Not owning a lock is safe here, as the free list is only accessed
