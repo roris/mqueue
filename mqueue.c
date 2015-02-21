@@ -14,8 +14,6 @@
 #define MQ_MQD_ALIVE	0x1
 #define MQ_PREFIX	L"/mq/"
 #define MQ_LOCK_SUFFIX	L".lock"
-#define MQ_FULL_EVENT_SUFFIX	L".1"
-#define MQ_EMPTY_EVENT_SUFFIX	L".0"
 #define MQ_LOCK_LEN	(SIZE_TO_WLEN(sizeof(MQ_LOCK_SUFFIX)))
 #define MQ_PREFIX_LEN	(SIZE_TO_WLEN(sizeof(MQ_PREFIX)))
 #define MQ_NAME_MAX	((MAX_PATH - MQ_LOCK_LEN) - MQ_PREFIX_LEN)
@@ -89,10 +87,15 @@ static void mqd_release_lock(struct mqd *d)
 	ReleaseMutex(d->mutex);
 }
 
-static int mqd_create_and_get_lock(struct mqd *d, wchar_t *name)
+static int mqd_create_and_get_lock(struct mqd *d, wchar_t *name, int namelen)
 {
 	int err;
 	int flags = d->flags;
+
+	if (name) {
+		name[namelen] = 0;
+		wcscat(name, L".lock");
+	}
 
 	if (flags & O_CREAT) {
 		d->mutex = CreateMutexW(NULL, TRUE, name);
@@ -181,7 +184,12 @@ void create_secdesc(mode_t mode)
 }
 #endif
 
-static WCHAR *inflate(const char *src, DWORD maxsize)
+static int
+inflate_conv(
+	wchar_t *out,
+	const char *src,
+	int *length,
+	DWORD maxsize)
 {
 	WCHAR *tmp;
 	DWORD tmpsize;
@@ -193,10 +201,16 @@ static WCHAR *inflate(const char *src, DWORD maxsize)
 				      NULL,
 				      0);
 
-	if (tmpsize > maxsize)
-		return NULL;
+	if (tmpsize > maxsize || tmpsize == 0)
+		return -1;
+
+	if (length)
+		*length = tmpsize / sizeof(wchar_t);
 
 	tmp = malloc(tmpsize);
+
+	if (tmp == NULL)
+		return -1;
 
 	MultiByteToWideChar(CP_THREAD_ACP,
 			    MB_ERR_INVALID_CHARS,
@@ -205,7 +219,11 @@ static WCHAR *inflate(const char *src, DWORD maxsize)
 			    tmp,
 			    tmpsize);
 
-	return tmp;
+	wcscpy(out, MQ_PREFIX);
+	wcscat(out, tmp);
+
+	free(tmp);
+	return 0;
 }
 
 static struct message *mqueue_get_msg(volatile struct mqueue *mq, int index)
@@ -217,7 +235,7 @@ static struct message *mqueue_get_msg(volatile struct mqueue *mq, int index)
 
 static int valid_open_attr(struct mq_attr *a)
 {
-	return a != NULL && a->mq_maxmsg > 0 && a->mq_msgsize > 0 &&
+	return a->mq_maxmsg > 0 && a->mq_msgsize > 0 &&
 		a->mq_sleepdur > 0;
 }
 
@@ -251,23 +269,36 @@ static HANDLE do_mqd_create_cond(struct mqd *d, wchar_t *name,
 	return res;
 }
 
-static int mqd_create_cond(struct mqd *d, wchar_t *empty, wchar_t *full)
+static int mqd_create_cond(struct mqd *d, wchar_t *name, int namelen)
 {
 	int i;
 
-	d->not_full = do_mqd_create_cond(d, full, TRUE);
+	if (name != NULL) {
+		name[namelen] = 0;
+		wcscat(name, L".evnf");
+	}
+	d->not_full = do_mqd_create_cond(d, name, TRUE);
 	if (d->not_full == NULL)
 		return -1;
 
-	d->not_empty = do_mqd_create_cond(d, empty, FALSE);
+	if (name != NULL) {
+		name[namelen] = 0;
+		wcscat(name, L".eve?");
+	}
+	d->not_empty = do_mqd_create_cond(d, name, FALSE);
 	if (d->not_empty == NULL)
 		goto close_not_full;
 
 	for (i = 0; i <= MQ_PRIO_MAX; ++i) {
-		d->not_empty_prio[i] = do_mqd_create_cond(d, empty, FALSE);
+		if (name != NULL) {
+			name[namelen + 4] = L'0' + (i % 10);
+			name[namelen + 3] = L'0' + (i / 10);
+		}
+		d->not_empty_prio[i] = do_mqd_create_cond(d, name, FALSE);
 		if (d->not_empty_prio[i] == NULL) {
-			for (--i; i >= 0; --i)
-				CloseHandle(d->not_empty_prio[i]);
+			int j = i - 1;
+			for (; j >= 0; --j)
+				CloseHandle(d->not_empty_prio[j]);
 			CloseHandle(d->not_empty);
 		close_not_full:
 			CloseHandle(d->not_full);
@@ -308,12 +339,11 @@ mqd_t mq_open(const char *name, int oflag, ...)
 	volatile struct mqd *qd;
 	struct mqueue *mq;
 	HANDLE *map;
-	wchar_t *mqname, *lkname, *wname, *cvfull, *cvempty;
-	/* TODO: do not use this many buffers. */
-	wchar_t lkname_[MAX_PATH], mqname_[MAX_PATH];
-	wchar_t cvfull_[MAX_PATH], cvempty_[MAX_PATH];
+	wchar_t wname[MAX_PATH];
+	wchar_t *nameptr;
 	DWORD err, mapacc;
 	int res, private;
+	int namelen;
 
 	res = -1;
 	private = oflag & O_PRIVATE;
@@ -326,43 +356,24 @@ mqd_t mq_open(const char *name, int oflag, ...)
 	}
 
 	/* convert the name to unicode */
-	wname = inflate(name, MQ_NAME_MAX);
-	if (wname == NULL) {
+	if (name != NULL && inflate_conv(wname, name, &namelen, MQ_NAME_MAX)) {
 		errno = ENAMETOOLONG;
 		goto unlock_table;
 	}
 
-	wcscpy(mqname_, MQ_PREFIX);
-	wcscat(mqname_, wname);
-
-	if (private) {
-		lkname = mqname = NULL;
-	} else {
-		wcscpy(lkname_, mqname_);
-		wcscat(lkname_, MQ_LOCK_SUFFIX);
-		wcscpy(cvfull_, mqname_);
-		wcscat(cvfull_, MQ_FULL_EVENT_SUFFIX);
-		wcscpy(cvempty_, mqname_);
-		wcscat(cvfull_, MQ_EMPTY_EVENT_SUFFIX);
-
-		lkname = lkname_;
-		mqname = mqname_;
-		cvfull = cvfull_;
-		cvempty = cvempty_;
-	}
-
-	free(wname);
 	memset(&d, 0, sizeof(d));
 	d.flags = oflag;
 
+
 	/* create the muteces */
-	if(mqd_create_and_get_lock(&d, lkname)) {
+	nameptr = name != NULL ? wname : NULL;
+	if(mqd_create_and_get_lock(&d, nameptr, namelen)) {
 		if ((errno == EEXIST && oflag & O_EXCL) || errno == EOTHER)
 			goto unlock_table;
 	}
 
 	/* create condition variables. */
-	if (mqd_create_cond(&d, cvempty, cvfull)) {
+	if (mqd_create_cond(&d, nameptr, namelen)) {
 		if ((errno == EEXIST && oflag & O_EXCL) || errno == EOTHER)
 			goto unlock_table;
 	}
@@ -415,7 +426,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		mapsize += mapsize % sizeof(int);
 
 		map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
-					 PAGE_READWRITE, 0, mapsize, mqname);
+					 PAGE_READWRITE, 0, mapsize, nameptr);
 
 		if (map == NULL) {
 			/* let the application handle failure :) */
@@ -440,9 +451,11 @@ mqd_t mq_open(const char *name, int oflag, ...)
 
 		mq->maxmsg = d.attr.mq_maxmsg;
 		mq->msgsize = d.attr.mq_curmsg;
-		memcpy(mq->name, mqname, wcslen(mqname));
-		mq->free_tail = d.attr.mq_maxmsg - 1;
 
+		if (name != NULL) {
+			memcpy(mq->name, wname, namelen);
+		}
+		mq->free_tail = d.attr.mq_maxmsg - 1;
 		for (i = 1; i < d.attr.mq_maxmsg; ++i) {
 			mqueue_get_msg(mq, i - 1)->next = i;
 			mqueue_get_msg(mq, i)->prev = i - 1;
@@ -452,7 +465,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 			mq->prio_head[i] = mq->prio_tail[i] = -1;
 		mqueue_get_msg(mq, d.attr.mq_maxmsg - 1)->next = -1;
 	} else {
-		map = OpenFileMappingW(mapacc, 0, mqname);
+		map = OpenFileMappingW(mapacc, 0, wname);
 
 		if (map == NULL) {
 			errno = ENOENT;
