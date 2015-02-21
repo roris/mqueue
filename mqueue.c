@@ -23,6 +23,7 @@ static struct mqdtable *mqdtab;
 static void mqd_destroy_lock(struct mqd *d)
 {
 	CloseHandle(d->mutex);
+	d->mutex = NULL;
 }
 
 static void mqdtable_lock(void)
@@ -100,39 +101,35 @@ static int mqd_create_and_get_lock(struct mqd *d, wchar_t *name, int namelen)
 	if (flags & O_CREAT) {
 		d->mutex = CreateMutexW(NULL, TRUE, name);
 		err = GetLastError();
-
-		if (err == ERROR_ALREADY_EXISTS) {
-			errno = EEXIST;
-			/* FAIL only if O_EXCL is set */
-			if (d->flags & O_EXCL)
-				return -1;
-
-			/* Signal the mutex. Errno will get changed on
-			 * failure which is OK.
-			 */
-			mq_wait_handle(d->mutex);
-			return -1;
+		if (d->mutex != NULL) {
+			if (err == ERROR_ALREADY_EXISTS) {
+				errno = EEXIST;
+				/* FAIL only if O_EXCL is set */
+				if (d->flags & O_EXCL)
+					return -1;
+				d->flags &= ~O_CREAT;
+				goto open_wait;
+			}
+			return 0;
 		}
-
 		/* mutex probably exists, so try to get a handle */
 		if (err == ERROR_ACCESS_DENIED)
 			goto open_mutex;
-
-		/* A mutex was opened and locked! */
-		if (d->mutex != NULL)
-			return 0;
-
 	} else {
 open_mutex:
 		d->mutex = OpenMutexW(SYNCHRONIZE, FALSE, name);
 
 		/*
 		 * If a handle was obtained, then return the value.
-		 * FIXME: handle wait failure.
 		 */
-		if (d->mutex != NULL)
-			return mq_wait_handle(d->mutex);
-
+		if (d->mutex != NULL) {
+open_wait:
+			if (mq_wait_handle(d->mutex)) {
+				mqd_destroy_lock(d);
+				return -1;
+			}
+			return 0;
+		}
 		/* mutex is null, check last and set ENOENT, if the
 		 * mutex does not exist.
 		 */
@@ -142,7 +139,6 @@ open_mutex:
 			return -1;
 		}
 	}
-
 	/* No idea what error codes lead to this */
 	SetLastError(err);
 	errno = EOTHER;
@@ -230,6 +226,7 @@ static struct message *mqueue_get_msg(volatile struct mqueue *mq, int index)
 {
 	if (index < 0 || index >= mq->maxmsg)
 		return NULL;
+
 	return (struct message*)&((char*)(mq->buffer))[index * mq->msgsize];
 }
 
@@ -243,20 +240,22 @@ static HANDLE do_mqd_create_cond(struct mqd *d, wchar_t *name,
 	BOOL signaled)
 {
 	HANDLE res;
-	DWORD err;
 
 	if (d->flags & O_CREAT) {
 		res = CreateEventW(NULL, TRUE, signaled, name);
-		err = GetLastError();
-		if (err == ERROR_ALREADY_EXISTS) {
-			if (d->flags & O_EXCL) {
-				CloseHandle(res);
-				res = NULL;
+
+		if (res != NULL) {
+			DWORD err;
+			err = GetLastError();
+			if (err == ERROR_ALREADY_EXISTS) {
+				if (d->flags & O_EXCL) {
+					CloseHandle(res);
+					res = NULL;
+				}
+				errno = EEXIST;
+				d->flags &= ~O_CREAT;
 			}
-			errno = EEXIST;
-			d->flags &= ~O_CREAT;
-		} else if (res == NULL) {
-			SetLastError(err);
+		} else {
 			errno = EOTHER;
 		}
 	} else {
@@ -280,7 +279,6 @@ static int mqd_create_cond(struct mqd *d, wchar_t *name, int namelen)
 	d->not_full = do_mqd_create_cond(d, name, TRUE);
 	if (d->not_full == NULL)
 		return -1;
-
 	if (name != NULL) {
 		name[namelen] = 0;
 		wcscat(name, L".eve?");
@@ -289,7 +287,7 @@ static int mqd_create_cond(struct mqd *d, wchar_t *name, int namelen)
 	if (d->not_empty == NULL)
 		goto close_not_full;
 
-	for (i = 0; i <= MQ_PRIO_MAX; ++i) {
+	for (i = 0; i < MQ_PRIO_MAX; i++) {
 		if (name != NULL) {
 			name[namelen + 4] = L'0' + (i % 10);
 			name[namelen + 3] = L'0' + (i / 10);
@@ -302,6 +300,7 @@ static int mqd_create_cond(struct mqd *d, wchar_t *name, int namelen)
 			CloseHandle(d->not_empty);
 		close_not_full:
 			CloseHandle(d->not_full);
+			d->not_full = NULL;
 			return -1;
 		}
 	}
@@ -368,13 +367,13 @@ mqd_t mq_open(const char *name, int oflag, ...)
 	/* create the muteces */
 	nameptr = name != NULL ? wname : NULL;
 	if(mqd_create_and_get_lock(&d, nameptr, namelen)) {
-		if ((errno == EEXIST && oflag & O_EXCL) || errno == EOTHER)
+		if (d.mutex == NULL)
 			goto unlock_table;
 	}
 
 	/* create condition variables. */
 	if (mqd_create_cond(&d, nameptr, namelen)) {
-		if ((errno == EEXIST && oflag & O_EXCL) || errno == EOTHER)
+		if (d.not_full == NULL)
 			goto unlock_table;
 	}
 
@@ -504,6 +503,7 @@ copy_open:
 	mqdtab->curopen++;
 
 	mqd_release_lock(&d);
+	res = 0;
 
 	if (0) {
 close_map:
