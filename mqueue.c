@@ -456,13 +456,26 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		}
 		mq->free_tail = d.attr.mq_maxmsg - 1;
 		for (i = 1; i < d.attr.mq_maxmsg; ++i) {
-			mqueue_get_msg(mq, i - 1)->next = i;
-			mqueue_get_msg(mq, i)->prev = i - 1;
+			struct message *c, *p;
+			p = mqueue_get_msg(mq, i - 1);
+			c = mqueue_get_msg(mq, i);
+			if (p != NULL && c != NULL) {
+				p->next = i;
+				c->prev = i - 1;
+			}
+			else break;
 		}
 
 		for (i = 0; i < MQ_PRIO_MAX; ++i)
 			mq->prio_head[i] = mq->prio_tail[i] = -1;
-		mqueue_get_msg(mq, d.attr.mq_maxmsg - 1)->next = -1;
+		{
+			struct message *m;
+			m = mqueue_get_msg(mq, d.attr.mq_maxmsg - 1);
+			if (m != NULL) {
+				m->prev = d.attr.mq_maxmsg - 2;
+			}
+		}
+
 	} else {
 		map = OpenFileMappingW(mapacc, 0, wname);
 
@@ -623,7 +636,9 @@ mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 	for (prio = startprio; prio >= minprio; --prio) {
 		if (q->prio_head[prio] != -1) {
 			m = mqueue_get_msg(q, q->prio_head[prio]);
-			goto received;
+			if (m != NULL) {
+				goto received;
+			}
 		}
 	}
 
