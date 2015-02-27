@@ -641,10 +641,7 @@ int mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 		errno = EPERM;
 		goto bad;
 	}
-
-	q = (void *)d->queue;
-	if (q->curmsg != 1)
-		goto get_message;
+	goto check_queue;
 
 	while (m == NULL) {
 again:
@@ -662,10 +659,10 @@ again:
 		if (d == NULL)
 			return -1;
 		/* another waiting thread may have received the message. */
+check_queue:
 		q = (void *)d->queue;
 		if (q->curmsg == 0)
 			goto again;
-get_message:
 		if (!queue_sanity_check(q)) {
 			goto bad_message;
 		}
@@ -691,9 +688,6 @@ bad_message:
 		goto bad;
 	}
 
-	m->flags &= ~MQ_MSG_ALIVE;
-	--q->curmsg;
-
 	if (q->free_tail >= 0) {
 		m->prev = q->free_tail;
 		mqueue_get_msg(q, q->free_tail)->next = q->prio_head[prio];
@@ -717,6 +711,8 @@ bad_message:
 			mq_cond_unset(d->not_empty);
 		mq_cond_unset(d->not_empty_prio[prio]);
 	}
+	m->flags &= ~MQ_MSG_ALIVE;
+	--q->curmsg;
 	memcpy(msg_ptr, m->buffer, m->size);
 	err = 0;
 	if (0) {
