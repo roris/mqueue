@@ -629,11 +629,10 @@ int mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 
 	if (!(d->flags & O_RDWR) && d->flags & O_WRONLY) {
 		errno = EPERM;
-		return -1;
+		goto bad;
 	}
 
 	q = (void *)d->queue;
-
 	if (q->curmsg != 1)
 		goto get_message;
 
@@ -659,18 +658,17 @@ again:
 			goto again;
 get_message:
 		if (!queue_sanitize(q)) {
-			errno = EBADMSG;
-			goto bad;
+			goto bad_message;
 		}
 		for (; prio >= minprio && m == NULL; --prio) {
 			int n = q->prio_head[prio];
 			if (n != -1) {
 				if (!QUEUE_INDEX_IN_RANGE(q, n)) {
-					errno = EBADMSG;
-					goto bad;
+					goto bad_message;
 				}
 				m = get_live_message(q, n);
 				if (m == NULL || message_sanity_check(m, q)) {
+bad_message:
 					errno = EBADMSG;
 					goto bad;
 				}
@@ -710,15 +708,13 @@ get_message:
 			mq_cond_unset(d->not_empty);
 		mq_cond_unset(d->not_empty_prio[prio]);
 	}
-
+	memcpy(msg_ptr, m->buffer, m->size);
 	err = 0;
-
 	if (0) {
 bad:
 		err = -1;
 	}
 
-	memcpy(msg_ptr, m->buffer, m->size);
 	mqd_release_lock(d);
 	return err;
 }
