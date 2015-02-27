@@ -70,13 +70,23 @@ static int mqd_get_lock(volatile struct mqd *d)
 #define QUEUE_INDEX_IN_RANGE(q, i)	(i >= -1 && i < q->maxmsg)
 #define VALID_QUEUE_INDEX(q, i)		(QUEUE_INDEX_IN_RANGE(q, i) && i != -1)
 
-static int queue_sanitize(struct mqueue *q)
+static int queue_sanity_check(struct mqueue *q)
 {
 	int elements_are_sane = 1;
 	int i = 0;
 
 	if (!(q->curmsg <= q->maxmsg && q->curmsg >= 0 && q->maxmsg != 0))
 		return 0;
+
+	if (q->curmsg == q->maxmsg) {
+		if (q->free_head != -1 || q->free_tail != -1)
+			return 0;
+	} else {
+		if (q->free_head == -1 || q->free_tail == -1)
+			return 0;
+		if (q->free_tail == q->free_head && q->maxmsg -1 != q->curmsg )
+			return 0;
+	}
 
 	for (; i < MQ_PRIO_MAX; ++i) {
 		elements_are_sane &= QUEUE_INDEX_IN_RANGE(q, q->prio_head[i]);
@@ -607,7 +617,7 @@ int mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 {
 	struct mqd *d;
 	struct mqueue *q;
-	struct message *m;
+	struct message *m = NULL;
 	int maxprio;
 	int minprio;
 	int prio;
@@ -636,7 +646,6 @@ int mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 	if (q->curmsg != 1)
 		goto get_message;
 
-	m = NULL;
 	while (m == NULL) {
 again:
 		if (d->flags & O_NONBLOCK) {
@@ -657,7 +666,7 @@ again:
 		if (q->curmsg == 0)
 			goto again;
 get_message:
-		if (!queue_sanitize(q)) {
+		if (!queue_sanity_check(q)) {
 			goto bad_message;
 		}
 		for (; prio >= minprio && m == NULL; --prio) {
@@ -721,10 +730,10 @@ bad:
 
 int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 {
-	struct mqd *d = NULL;
+	struct mqd *d;
 	struct mqueue *q;
 	struct message *prev;
-	struct message *m;
+	struct message *m = NULL;
 	int res = 0;
 	int prio = msg_prio;
 
@@ -739,104 +748,69 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 		return -1;
 	}
 
-	/* discard volatile qualifier, as the queue will not be modified by
-	 * other threads
-	 */
-	q = (void *)d->queue;
-
-	if (msg_size > d->attr.mq_msgsize) {
-		errno = EMSGSIZE;
-		goto bad;
-	}
-
 	/* Check the queue's permisions */
 	if (!(d->flags & (O_RDWR | O_WRONLY))) {
 		errno = EPERM;
 		goto bad;
 	}
+	goto check_queue;
 
-	if (q->curmsg != q->maxmsg) {
-		goto send;
-	}
-
-	while (!(d->flags & O_NONBLOCK)) {
-		mqd_release_lock(d);
-		mq_wait_handle(&d->not_full);
-		d = get_and_lock_mqd(des);
-		if (d == NULL) {
-			errno = EBADF;
-			return -1;
-		}
-		if (q->curmsg > q->maxmsg || q->curmsg < 0) {
-			errno = EBADMSG;
-			goto bad;
-		}
-	}
-	if (q->free_head == -1) {
-		while (!(d->flags & O_NONBLOCK)) {
-			mqd_release_lock(d);
-			mq_wait_handle(&d->not_full);
-			d = get_and_lock_mqd(des);
-			if (d == NULL) {
-				errno = EBADF;
-				return -1;
-			}
-			if (d->queue->free_head != -1) {
-				q = (void *)d->queue;
-				goto send;
-			}
-		}
+again:
+	if (d->flags & O_NONBLOCK) {
 		errno = EAGAIN;
 		goto bad;
 	}
+	mqd_release_lock(d);
+	mq_wait_handle(d->not_full);
+	d = get_and_lock_mqd(des);
+	if (d == NULL) {
+		errno = EBADF;
+		return -1;
+	}
 
-	if (q->curmsg > d->attr.mq_maxmsg) {
+check_queue:
+	q = (void*)d->queue;
+	if (msg_size > q->msgsize) {
+		errno = EMSGSIZE;
+		goto bad;
+	}
+	if (!queue_is_sane(q))
+		goto bad_message;
+	if (q->curmsg == q->maxmsg)
+		goto again;
+	if (q->free_head == -1) {
+bad_message:
 		errno = EBADMSG;
 		goto bad;
 	}
-
-send:
-	if (q->prio_tail[msg_prio] < -1 || q->prio_tail[msg_prio] >= q->maxmsg
-	    || q->free_head < -1 || q->free_head >= q->maxmsg) {
-		errno = EBADMSG;
-		goto bad;
-	}
-	/* create the message */
-	m = mqueue_get_msg(q, q->free_head);
-	if (m->next < -1 || m->next >= q->maxmsg) {
-		errno = EBADMSG;
-		goto bad;
-	}
-
+	m = get_message(q, q->free_head);
 	m->size = msg_size;
-	m->flags = MQ_MSG_ALIVE;
-	memcpy(m->buffer, msg_ptr, msg_size);
 	m->prev = q->prio_tail[msg_prio];
-	prev = mqueue_get_msg(q, q->prio_tail[msg_prio]);
 
 	if (VALID_QUEUE_INDEX(q, q->prio_tail[msg_prio])
 	    && q->prio_tail[msg_prio]) {
 		/* Put the new message in the queue. Ignore value of m->prev */
-		q->prio_tail[msg_prio] = prev->next = q->free_head;
+		get_message(q, q->prio_tail[msg_prio])->next = q->free_head;
+		q->prio_tail[msg_prio] = q->free_head;
 	}
 
-	/* check if the queue can hold more messages */
-	if (m->next == -1) {
+	/* no remaining free message slots */
+	if (q->curmsg == q->maxmsg - 1) {
 		q->free_head = q->free_tail = -1;
 		mq_cond_unset(&d->not_full);
 	} else {
 		q->free_head = m->next;
 	}
-
 	m->next = -1;
-	++q->curmsg;
-
 	/* signal that the queue is not empty */
-	if (q->curmsg == 1) {
+	if (q->curmsg == 0) {
 		mq_cond_set(&d->not_empty);
 		mq_cond_set(&d->not_empty_prio[msg_prio]);
 	}
 
+	m->flags = MQ_MSG_ALIVE;
+	++q->curmsg;
+	memcpy(m->buffer, msg_ptr, msg_size);
 	if (0) {
 bad:
 		res = -1;
