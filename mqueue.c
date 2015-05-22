@@ -62,6 +62,19 @@ static int mq_wait_handle(HANDLE h)
 	return -1;
 }
 
+static int release_and_wait(HANDLE rel, HANDLE wait)
+{
+	switch (SignalObjectAndWait(rel, wait, INFINITE, FALSE)) {
+	case WAIT_ABANDONED:
+		errno = EBADMSG;
+		return -1;
+	case WAIT_OBJECT_0:
+		return 0;
+	}
+	errno = EOTHER;
+	return -1;
+}
+
 static int mqd_get_lock(volatile struct mqd *d)
 {
 	return mq_wait_handle(d->mutex);
@@ -84,7 +97,7 @@ static int queue_sanity_check(struct mqueue *q)
 	} else {
 		if (q->free_head == -1 || q->free_tail == -1)
 			return 0;
-		if (q->free_tail == q->free_head && q->maxmsg -1 != q->curmsg )
+		if (q->free_tail == q->free_head && q->maxmsg - 1 != q->curmsg)
 			return 0;
 	}
 
@@ -111,7 +124,7 @@ static struct mqd *get_and_lock_mqd(mqd_t mqdes)
 
 	res = (void *)get_mqd(mqdes);
 
-	if (res != NULL)
+	if (res)
 		mqd_get_lock(res);
 
 	mqdtable_unlock();
@@ -137,7 +150,7 @@ static int mqd_create_and_get_lock(struct mqd *d, wchar_t * name, int namelen)
 	if (flags & O_CREAT) {
 		d->mutex = CreateMutexW(NULL, TRUE, name);
 		err = GetLastError();
-		if (d->mutex != NULL) {
+		if (d->mutex) {
 			if (err == ERROR_ALREADY_EXISTS) {
 				errno = EEXIST;
 				/* FAIL only if O_EXCL is set */
@@ -158,7 +171,7 @@ open_mutex:
 		/*
 		 * If a handle was obtained, then return the value.
 		 */
-		if (d->mutex != NULL) {
+		if (d->mutex) {
 open_wait:
 			if (mq_wait_handle(d->mutex)) {
 				mqd_destroy_lock(d);
@@ -194,7 +207,7 @@ void create_secdesc(mode_t mode)
 
 	size = SECURITY_MAX_SID_SIZE;
 
-	if (oth == NULL)
+	if (!oth)
 		oth = LocalAlloc(LMEM_FIXED, size);
 
 	/* XXX: what happens if NULL is passed instead of size? */
@@ -231,9 +244,10 @@ inflate_conv(wchar_t * out, const char *src, int *length, DWORD maxsize)
 	if (length)
 		*length = tmpsize / sizeof(wchar_t);
 
+	/* should this be changed to something else? */
 	tmp = malloc(tmpsize);
 
-	if (tmp == NULL)
+	if (!tmp)
 		return -1;
 
 	MultiByteToWideChar(CP_THREAD_ACP,
@@ -246,14 +260,14 @@ inflate_conv(wchar_t * out, const char *src, int *length, DWORD maxsize)
 	return 0;
 }
 
-static struct message *mqueue_get_msg(struct mqueue *mq, int index)
+static struct message *get_message(struct mqueue *mq, int index)
 {
 	return (struct message *)&((char *)(mq->buffer))[index * mq->msgsize];
 }
 
 static struct message *get_live_message(struct mqueue *q, int n)
 {
-	struct message *m = mqueue_get_msg(q, n);
+	struct message *m = get_message(q, n);
 	return (m->flags & MQ_MSG_ALIVE) ? m : NULL;
 }
 
@@ -269,7 +283,7 @@ static HANDLE do_mqd_create_cond(struct mqd *d, wchar_t * name, BOOL signaled)
 	if (d->flags & O_CREAT) {
 		res = CreateEventW(NULL, TRUE, signaled, name);
 
-		if (res != NULL) {
+		if (res) {
 			DWORD err;
 			err = GetLastError();
 			if (err == ERROR_ALREADY_EXISTS) {
@@ -285,7 +299,7 @@ static HANDLE do_mqd_create_cond(struct mqd *d, wchar_t * name, BOOL signaled)
 		}
 	} else {
 		res = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
-		if (res == NULL) {
+		if (!res) {
 			errno = EOTHER;
 		}
 	}
@@ -297,28 +311,28 @@ static int mqd_create_cond(struct mqd *d, wchar_t * name, int namelen)
 {
 	int i;
 
-	if (name != NULL) {
+	if (name) {
 		name[namelen] = 0;
 		wcscat(name, L".evnf");
 	}
 	d->not_full = do_mqd_create_cond(d, name, TRUE);
-	if (d->not_full == NULL)
+	if (!d->not_full)
 		return -1;
-	if (name != NULL) {
+	if (name) {
 		name[namelen] = 0;
 		wcscat(name, L".eve?");
 	}
 	d->not_empty = do_mqd_create_cond(d, name, FALSE);
-	if (d->not_empty == NULL)
+	if (!d->not_empty)
 		goto close_not_full;
 
 	for (i = 0; i < MQ_PRIO_MAX; i++) {
-		if (name != NULL) {
+		if (name) {
 			name[namelen + 4] = L'0' + (i % 10);
 			name[namelen + 3] = L'0' + (i / 10);
 		}
 		d->not_empty_prio[i] = do_mqd_create_cond(d, name, FALSE);
-		if (d->not_empty_prio[i] == NULL) {
+		if (!d->not_empty_prio[i]) {
 			int j = i - 1;
 			for (; j >= 0; --j)
 				CloseHandle(d->not_empty_prio[j]);
@@ -356,33 +370,68 @@ static void mqd_destroy_cond(struct mqd *d)
 	}
 }
 
+static void move_to_list(struct mqd *dp, struct mqd_list *dest,
+			 struct mqd_list *src)
+{
+	/* Unlink from src first */
+	if (dp->prev) {
+		dp->prev->next = dp->next;
+	} else {
+		/* This is the head, so set the next node as the head. */
+		src->head = dp->next;
+	}
+
+	/* Unlink the next node and this node. */
+	if (dp->next) {
+		dp->next->prev = dp->prev;
+	} else {
+		/* This is the tail. Make src->tail = prev. */
+		src->tail = dp->prev;
+	}
+
+	/* Link this with dest. */
+	dp->prev = dest->tail;
+	dp->next = NULL;
+
+	/* Link dest with this. */
+	if (dest->tail) {
+		dest->tail = dest->tail->next = dp;
+	} else {
+		dest->tail = dest->tail = dp;
+	}
+}
+
 mqd_t mq_open(const char *name, int oflag, ...)
 {
-	va_list al;
 	struct mqd d;
 	volatile struct mqd *qd;
 	struct mqueue *mq;
 	HANDLE *map;
-	wchar_t wname[MAX_PATH];
 	wchar_t *nameptr;
-	DWORD err, mapacc;
-	int res, private;
-	int namelen;
+	wchar_t wname[MAX_PATH];
 	long msgsize;
+	DWORD err;
+	DWORD mapacc;
 	long maxmsg;
+	int res;
+	int namelen;
+	va_list al;
 
 	res = -1;
-	private = oflag & O_PRIVATE;
-
 	mqdtable_lock();
 
-	if (mqdtab->curopen == MQ_OPEN_MAX) {
+	/*
+	 * An application can open a max of MQ_OPEN_MAX queues. Check if the
+	 * requesting application can open any more queues.
+	 */
+	if (mqdtab->curopen >= MQ_OPEN_MAX) {
 		errno = EMFILE;
 		goto unlock_table;
 	}
 
-	/* convert the name to unicode */
-	if (name != NULL && inflate_conv(wname, name, &namelen, MQ_NAME_MAX)) {
+	/* Convert the name to unicode. */
+	namelen = 0;
+	if (name && inflate_conv(wname, name, &namelen, MQ_NAME_MAX)) {
 		errno = ENAMETOOLONG;
 		goto unlock_table;
 	}
@@ -390,16 +439,18 @@ mqd_t mq_open(const char *name, int oflag, ...)
 	memset(&d, 0, sizeof(d));
 	d.flags = oflag;
 
-	/* create the muteces */
-	nameptr = (name != NULL) ? wname : NULL;
+	/* Create the muteces first to prevent the queue from being created
+	 * twice?
+	 */
+	nameptr = (name) ? wname : NULL;
 	if (mqd_create_and_get_lock(&d, nameptr, namelen)) {
-		if (d.mutex == NULL)
+		if (!d.mutex)
 			goto unlock_table;
 	}
 
 	/* create condition variables. */
 	if (mqd_create_cond(&d, nameptr, namelen)) {
-		if (d.not_full == NULL)
+		if (!d.not_full)
 			goto unlock_table;
 	}
 
@@ -419,7 +470,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		goto destroy_cond;
 	}
 
-	/* map the page file */
+	/* The application is requesting a new queue to be created. */
 	if (oflag & O_CREAT) {
 		struct mq_attr *attr;
 		DWORD mapsize;
@@ -429,10 +480,18 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		va_start(al, oflag);
 		mode = va_arg(al, int);
 		attr = va_arg(al, struct mq_attr *);
+		(void)mode;
 
-		/* secdesc = create_secdesc(mode); */
+		/*
+		 * FIXME: create a good security descritor.
+		 * secdesc = create_secdesc(mode);
+		 */
 
-		if (attr == NULL) {
+		/*
+		 * Check if the user has provided any attributes for the queue,
+		 * then set the attributes accordingly.
+		 */
+		if (!attr) {
 			maxmsg = MQ_MAX_MSG;
 			msgsize = MQ_MSG_SIZE;
 		} else if (valid_open_attr(attr)) {
@@ -442,7 +501,8 @@ mqd_t mq_open(const char *name, int oflag, ...)
 			errno = EINVAL;
 			goto destroy_lock;
 		}
-		/* Calculate the required size for the queue */
+
+		/* Calculate the required size for the queue. */
 		msgsize = (sizeof(struct message) + msgsize - 1);
 		msgsize += msgsize % sizeof(int);
 		mapsize = (sizeof(struct mqueue) - 1) + (msgsize * maxmsg);
@@ -450,8 +510,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 
 		map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
 					 PAGE_READWRITE, 0, mapsize, nameptr);
-
-		if (map == NULL) {
+		if (!map) {
 			errno = EOTHER;
 			goto destroy_lock;
 		}
@@ -466,7 +525,7 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		}
 
 		mq = MapViewOfFile(map, mapacc, 0, 0, 0);
-		if (mq == NULL) {
+		if (!mq) {
 			errno = EOTHER;
 			goto close_map;
 		}
@@ -474,16 +533,16 @@ mqd_t mq_open(const char *name, int oflag, ...)
 		mq->maxmsg = maxmsg;
 		mq->msgsize = msgsize - (sizeof(struct message) + 1);
 
-		if (name != NULL) {
+		if (name) {
 			memcpy(mq->name, wname, namelen);
 			mq->namelen = namelen;
 		}
 		mq->free_tail = maxmsg - 1;
 		for (i = 1; i < maxmsg; ++i) {
-			mqueue_get_msg(mq, i - 1)->next = i;
-			mqueue_get_msg(mq, i)->prev = i - 1;
+			get_message(mq, i - 1)->next = i;
+			get_message(mq, i)->prev = i - 1;
 		}
-		mqueue_get_msg(mq, maxmsg - 1)->next = -1;
+		get_message(mq, maxmsg - 1)->next = -1;
 
 		for (i = 0; i < MQ_PRIO_MAX; ++i) {
 			mq->prio_head[i] = mq->prio_tail[i] = -1;
@@ -492,13 +551,13 @@ mqd_t mq_open(const char *name, int oflag, ...)
 	} else {
 		map = OpenFileMappingW(mapacc, 0, wname);
 
-		if (map == NULL) {
+		if (!map) {
 			errno = ENOENT;
 			goto destroy_lock;
 		}
 copy_open:
 		mq = MapViewOfFile(map, mapacc, 0, 0, 0);
-		if (mq == NULL) {
+		if (!mq) {
 			errno = EOTHER;
 			goto close_map;
 		}
@@ -511,25 +570,19 @@ copy_open:
 	d.flags = oflag;
 	d.eflags = MQ_MQD_ALIVE;
 
-	/* Since the table is locked here, it is not necessary to lock the
-	 * other queue descriptors
+	/*
+	 * Since the table is locked here, it is not necessary to lock the
+	 * other queue descriptors. It is impossible for the process to have
+	 * MQ_OPEN_MAX queues open so mqd.free_mqd.head will not have been
+	 * reached.
+	 *
+	 * TODO: merge mqd.free_mqd.head and mqd.curopen.
+	 *
 	 */
-	qd = mqdtab->free_mqd.head;
 
-	if (qd->next)
-		qd->next->prev = NULL;
-	else
-		mqdtab->free_mqd.tail = NULL;
-	mqdtab->free_mqd.head = qd->next;
-
-	qd->prev = mqdtab->live_mqd.tail;
-	if (qd->prev)
-		qd->prev->next = (void *)qd;
-	else
-		mqdtab->live_mqd.tail = mqdtab->live_mqd.head = (void *)qd;
-
-	qd->next = NULL;
-	*qd = d;
+	*mqdtab->free_mqd.head = d;
+	move_to_list(mqdtab->free_mqd.head, &mqdtab->open_mqd,
+		     &mqdtab->free_mqd);
 	mqdtab->curopen++;
 
 	mqd_release_lock(&d);
@@ -550,55 +603,54 @@ unlock_table:
 	return res;
 }
 
+/**
+ * WARNING: call only after locking mqdtab.
+ */
+static void mqd_close(struct mqd *d)
+{
+	/* Get the lock. Another thread might be owning the queue's lock. */
+	mqd_get_lock(d);
+
+	/* Turn off the live flag to prevent the queue from being accessed. */
+	d->flags &= ~MQ_MQD_ALIVE;
+
+	/* Free resources. */
+	UnmapViewOfFile((LPVOID) d->queue);
+	CloseHandle(d->map);
+	if (!(d->flags & O_PRIVATE))
+		CloseHandle(d->mutex);
+
+	/*
+	 * Not owning a lock is safe here, as the free list is only accessed
+	 * after the table's lock is owned. The current queue descriptor is
+	 * appended to the mqtable's free list. If the free list does not have
+	 * a tail, it set as the list's head and tail.
+	 */
+	move_to_list(d, &mqdtab->free_mqd, &mqdtab->open_mqd);
+
+	--mqdtab->curopen;
+	/* finally destroy the queue's lock. */
+	mqd_destroy_lock(d);
+}
+
 int mq_close(mqd_t mqdes)
 {
-	struct mqd *d;
+	volatile struct mqd *d;
 	int err;
 
 	/* lock table first */
 	mqdtable_lock();
 	d = (void *)get_mqd(mqdes);
 
-	if (d == NULL) {
+	/* Check The queue was already closed by another thread. */
+	if (d) {
+		mqd_close(d);
+		err = 0;
+	} else {
 		errno = EBADF;
 		err = -1;
 		goto out;
 	}
-
-	/* get the lock */
-	mqd_get_lock(d);
-	d->flags &= ~MQ_MQD_ALIVE;
-
-	/* free resources */
-	UnmapViewOfFile((LPVOID) d->queue);
-	CloseHandle(d->map);
-	if (!(d->flags & O_PRIVATE))
-		CloseHandle(d->mutex);
-
-	if (d->next)
-		d->next->prev = d->prev;
-
-	if (d->prev)
-		d->prev->next = d->next;
-
-	/*
-	 * Not owning a lock is safe here, as the free list is only accessed
-	 * after the table's lock is owned.
-	 */
-	if (mqdtab->free_mqd.tail) {
-		mqdtab->free_mqd.tail->next = (void *)d;
-		d->prev = mqdtab->free_mqd.tail;
-		mqdtab->free_mqd.tail = (void *)d;
-		d->next = NULL;
-	} else {
-		mqdtab->free_mqd.tail = mqdtab->free_mqd.head = (void *)d;
-		d->next = d->prev = NULL;
-	}
-
-	/* finally destroy the queue's lock and release the table's lock */
-	--mqdtab->curopen;
-	mqd_destroy_lock(d);
-	err = 0;
 out:
 	mqdtable_unlock();
 	return err;
@@ -618,21 +670,19 @@ int mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 	struct mqd *d;
 	struct mqueue *q;
 	struct message *m = NULL;
-	int maxprio;
-	int minprio;
+	int maxprio(msg_prio) ? *msg_prio : MQ_PRIO_MAX - 1;
+	int minprio = (msg_prio) ? *msg_prio : 0;;
 	int prio;
 	int err;
 
-	minprio = msg_prio ? *msg_prio : 0;
-	maxprio = msg_prio ? *msg_prio : MQ_PRIO_MAX - 1;
 	prio = maxprio;
-	if (msg_ptr == NULL || minprio < 0 || maxprio >= MQ_PRIO_MAX) {
+	if (!msg_ptr || minprio < 0 || maxprio >= MQ_PRIO_MAX) {
 		errno = EINVAL;
 		return -1;
 	}
 
 	d = get_and_lock_mqd(des);
-	if (d == NULL) {
+	if (!d) {
 		errno = EBADF;
 		return -1;
 	}
@@ -643,7 +693,7 @@ int mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 	}
 	goto check_queue;
 
-	while (m == NULL) {
+	while (!m) {
 again:
 		if (d->flags & O_NONBLOCK) {
 			errno = EAGAIN;
@@ -656,7 +706,7 @@ again:
 			mq_wait_handle(d->not_empty);
 		}
 		d = get_and_lock_mqd(des);
-		if (d == NULL)
+		if (!d)
 			return -1;
 		/* another waiting thread may have received the message. */
 check_queue:
@@ -666,14 +716,14 @@ check_queue:
 		if (!queue_sanity_check(q)) {
 			goto bad_message;
 		}
-		for (; prio >= minprio && m == NULL; --prio) {
+		for (; prio >= minprio && !m; --prio) {
 			int n = q->prio_head[prio];
 			if (n != -1) {
 				if (!QUEUE_INDEX_IN_RANGE(q, n)) {
 					goto bad_message;
 				}
 				m = get_live_message(q, n);
-				if (m == NULL || message_sanity_check(m, q)) {
+				if (!m || message_sanity_check(m, q)) {
 bad_message:
 					errno = EBADMSG;
 					goto bad;
@@ -690,7 +740,7 @@ bad_message:
 
 	if (q->free_tail >= 0) {
 		m->prev = q->free_tail;
-		mqueue_get_msg(q, q->free_tail)->next = q->prio_head[prio];
+		get_message(q, q->free_tail)->next = q->prio_head[prio];
 		q->free_tail = q->prio_head[prio];
 	} else {
 		/* queue was full until this message was reached */
@@ -702,7 +752,7 @@ bad_message:
 	}
 
 	if (m->next >= 0) {
-		mqueue_get_msg(q, m->next)->prev = -1;
+		get_message(q, m->next)->prev = -1;
 		q->prio_head[prio] = m->next;
 	} else {
 		q->prio_head[prio] = -1;
@@ -733,18 +783,18 @@ int mq_send(mqd_t des, const char *msg_ptr, size_t msg_size, unsigned msg_prio)
 	int res = 0;
 	int prio = msg_prio;
 
-	if (prio >= MQ_PRIO_MAX || prio < 0 || msg_ptr == NULL) {
+	if (prio >= MQ_PRIO_MAX || prio < 0 || !msg_ptr) {
 		errno = EINVAL;
 		return -1;
 	}
 
 	d = get_and_lock_mqd(des);
-	if (d == NULL) {
+	if (!d) {
 		errno = EBADF;
 		return -1;
 	}
 
-	/* Check the queue's permisions */
+	/* Check the queue's permisions, ones passed to mq_open. */
 	if (!(d->flags & (O_RDWR | O_WRONLY))) {
 		errno = EPERM;
 		goto bad;
@@ -759,18 +809,18 @@ again:
 	mqd_release_lock(d);
 	mq_wait_handle(d->not_full);
 	d = get_and_lock_mqd(des);
-	if (d == NULL) {
+	if (!d) {
 		errno = EBADF;
 		return -1;
 	}
 
 check_queue:
-	q = (void*)d->queue;
+	q = (void *)d->queue;
 	if (msg_size > q->msgsize) {
 		errno = EMSGSIZE;
 		goto bad;
 	}
-	if (!queue_is_sane(q))
+	if (!queue_sanity_check(q))
 		goto bad_message;
 	if (q->curmsg == q->maxmsg)
 		goto again;
@@ -815,6 +865,83 @@ bad:
 	return res;
 }
 
+unsigned __stdcall notify_proc(void *arg)
+{
+	mqd_t des = (mqd_t) arg;
+	int empty = 0;
+	DWORD pid = GetCurrentProcessId();
+	struct mqd *d = get_and_lock_mqd(des);
+
+	/*
+	 * The queue had been deleted before execution reached this point.
+	 */
+	if (!d)
+		return EXIT_FAILURE;
+	empty = !d->queue->curmsg;
+
+	while (!empty) {
+		unlock_and_wait(d->queue);
+		d = get_and_lock_mqd(des);
+		/* queue got deleted :( */
+		if (!d)
+			return EXIT_FAILURE;
+		empty = !d->queue->curmsg;
+	}
+
+	switch (!wait_event(d->not_empty, 5000)) {
+	case WAIT_TIMEOUT:
+		break;
+	case WAIT_ABANDONED:
+		/* signal queue to be destroyed? */
+		return EXIT_FAILURE;
+	case WAIT_OBJECT_0:
+		d->notification.notify_proc();
+	}
+
+	if (d->notification->sigev_notify == SIGEV_NONE) {
+		memset(d->notification, 0, sizeof(d->notification));
+		if (d->queue->pid == GetCurrentProcessId()) {
+			d->queue->pid = 0;
+		}
+	}
+	return 0;
+}
+
+int mq_notify(mqd_t mqdes, const struct sigevent *notification)
+{
+	struct mqd *d = get_and_lock_mqd(mqdes);
+	DWORD pid = GetCurrentProcessId();
+
+	if (!d) {
+		errno = EBADF;
+		return -1;
+	}
+
+	if (!notification && d->queue->pid == pid) {
+		d->queue->pid = 0;
+		d->notification = NULL;
+		return 0;
+	}
+
+	if (!notification || d->queue->pid != 0) {
+		errno = EBUSY;
+		return -1;
+	}
+
+	d->queue->pid = pid;
+	d->notification = *notification;
+	d->tid =
+	    _beginthreadex(NULL, 0, notify_proc, d, 1,
+			   STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+
+	if (d->tid == ((HANDLE) - 1)) {
+		errno = EOTHER;
+		return -1;
+	}
+
+	return 0;
+}
+
 int mq_unlink(const char *name)
 {
 	errno = ENOSYS;
@@ -823,10 +950,12 @@ int mq_unlink(const char *name)
 
 static int mqdtable_init(void)
 {
-	if (mqdtab == NULL)
-		mqdtab = calloc(1, sizeof(struct mqdtable));
+	if (mqdtab)
+		return;
 
-	if (mqdtab != NULL) {
+	mqdtab = calloc(1, sizeof(struct mqdtable));
+
+	if (mqdtab) {
 		/* create a lock */
 		int i = 1;
 		InitializeCriticalSection(&mqdtab->lock);
@@ -842,13 +971,33 @@ static int mqdtable_init(void)
 	return -1;
 }
 
-BOOL WINAPI DllMain(HINSTANCE instance, DWORD fdwReason, LPVOID reserved)
+static int mqdtable_fini(void)
 {
-	switch (fdwReason) {
+	if (mqdtab) {
+		struct mqd *desc = mqdtab->open_mqd.head, *p;
+
+		while (desc) {
+			p = desc->next;
+			mqd_close(desc);
+			desc = p;
+		}
+
+		DestroyCriticalSection(&mqdtab->lock);
+		free(mqdtab);
+		mqdtab = NULL;
+	}
+}
+
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
+{
+	switch (reason) {
 	case DLL_PROCESS_ATTACH:
 		if (mqdtable_init())
 			return FALSE;
 		break;
+	case DLL_PROCESS_DETACH:
+		if (!reserved)
+			mqdtable_fini();
 	}
 	return TRUE;
 }

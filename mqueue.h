@@ -1,11 +1,14 @@
 #ifndef MQUEUE_H
 #define MQUEUE_H
 
-#include <stddef.h>
-
 /* not defined by windows */
+#ifndef MQ_NO_NONBLOCK
 #define O_NONBLOCK	0x10000000L
+#endif
+
+#ifndef MQ_NO_O_PRIVATE
 #define O_PRIVATE	0x40000000L
+#endif
 
 /* MQ constants */
 #define MQ_OPEN_MAX	128	/* maximum number of open message queues */
@@ -24,10 +27,9 @@ struct mq_attr {
 };
 
 int mq_send(mqd_t mqdes, const char *msg_ptr, size_t msg_len,
-	unsigned msg_prio);
-int mq_receive(mqd_t mqdes, char *msg_ptr, size_t msg_len,
-	unsigned *msg_prio);
-mqd_t mq_open(const char *, int oflag, ...);
+	    unsigned msg_prio);
+int mq_receive(mqd_t mqdes, char *msg_ptr, size_t msg_len, unsigned *msg_prio);
+mqd_t mq_open(const char *name, int oflag, ...);
 int mq_close(mqd_t mqdes);
 
 #endif
