@@ -620,14 +620,6 @@ static void mqd_close(struct mqd *d)
 	if (!(d->flags & O_PRIVATE))
 		CloseHandle(d->mutex);
 
-	/*
-	 * Not owning a lock is safe here, as the free list is only accessed
-	 * after the table's lock is owned. The current queue descriptor is
-	 * appended to the mqtable's free list. If the free list does not have
-	 * a tail, it set as the list's head and tail.
-	 */
-	move_to_list(d, &mqdtab->free_mqd, &mqdtab->open_mqd);
-
 	--mqdtab->curopen;
 	/* finally destroy the queue's lock. */
 	mqd_destroy_lock(d);
@@ -651,6 +643,14 @@ int mq_close(mqd_t mqdes)
 		err = -1;
 		goto out;
 	}
+
+	/*
+	 * Not owning a lock is safe here, as the free list is only accessed
+	 * after the table's lock is owned. The current queue descriptor is
+	 * appended to the mqtable's free list. If the free list does not have
+	 * a tail, it set as the list's head and tail.
+	 */
+	move_to_list(d, &mqdtab->free_mqd, &mqdtab->open_mqd);
 out:
 	mqdtable_unlock();
 	return err;
@@ -670,8 +670,8 @@ int mq_receive(mqd_t des, char *msg_ptr, size_t msg_size, unsigned *msg_prio)
 	struct mqd *d;
 	struct mqueue *q;
 	struct message *m = NULL;
-	int maxprio(msg_prio) ? *msg_prio : MQ_PRIO_MAX - 1;
-	int minprio = (msg_prio) ? *msg_prio : 0;;
+	int maxprio = (msg_prio) ? *msg_prio : MQ_PRIO_MAX - 1;
+	int minprio = (msg_prio) ? *msg_prio : 0;
 	int prio;
 	int err;
 
