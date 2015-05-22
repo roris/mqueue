@@ -10,6 +10,25 @@
 #define O_PRIVATE	0x40000000L
 #endif
 
+#ifndef MQ_NO_SIGEVENT
+
+#include <pthread.h>
+
+#define SIGEV_NONE	0x1
+#define SIGEV_SIGNAL	0x2
+#define SIGEV_THREAD	0x4
+
+union sigval {
+	int sival_int;
+};
+
+struct sigevent {
+	int sigev_notify;
+	int sigev_signo;
+	union sigval sigev_value;
+};
+#endif
+
 /* MQ constants */
 #define MQ_OPEN_MAX	128	/* maximum number of open message queues */
 #define MQ_MSG_SIZE	512	/* maximum message size */
