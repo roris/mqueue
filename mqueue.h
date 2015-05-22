@@ -20,12 +20,15 @@
 
 union sigval {
 	int sival_int;
+	void *sival_ptr;
 };
 
 struct sigevent {
 	int sigev_notify;
 	int sigev_signo;
 	union sigval sigev_value;
+	void (__cdecl * sigev_notify_function);
+	void *sigev_notify_attributes;
 };
 #endif
 

@@ -326,6 +326,10 @@ static int mqd_create_cond(struct mqd *d, wchar_t * name, int namelen)
 	if (!d->not_empty)
 		goto close_not_full;
 
+	d->empty = do_mqd_create_cond(d, name, TRUE);
+	if (!d->empty)
+		goto close_not_empty;
+
 	for (i = 0; i < MQ_PRIO_MAX; i++) {
 		if (name) {
 			name[namelen + 4] = L'0' + (i % 10);
@@ -336,6 +340,7 @@ static int mqd_create_cond(struct mqd *d, wchar_t * name, int namelen)
 			int j = i - 1;
 			for (; j >= 0; --j)
 				CloseHandle(d->not_empty_prio[j]);
+close_not_empty:
 			CloseHandle(d->not_empty);
 close_not_full:
 			CloseHandle(d->not_full);
@@ -363,6 +368,8 @@ static void mqd_destroy_cond(struct mqd *d)
 	CloseHandle(d->not_full);
 	mq_cond_set(d->not_empty);
 	CloseHandle(d->not_empty);
+	mq_cond_set(d->empty);
+	CloseHandle(d->empty);
 
 	for (i = 0; i < MQ_PRIO_MAX; ++i) {
 		mq_cond_set(d->not_empty_prio[i]);
@@ -614,8 +621,14 @@ static void mqd_close(struct mqd *d)
 	/* Turn off the live flag to prevent the queue from being accessed. */
 	d->flags &= ~MQ_MQD_ALIVE;
 
+	if (d->queue->pid == GetCurrentProcessId()) {
+		d->queue->pid = 0;
+		pthread_cancel(d->thread);
+	}
+	mqd_destroy_cond(d);
 	/* Free resources. */
-	UnmapViewOfFile((LPVOID) d->queue);
+	if (d->thread)
+		UnmapViewOfFile((LPVOID) d->queue);
 	CloseHandle(d->map);
 	if (!(d->flags & O_PRIVATE))
 		CloseHandle(d->mutex);
@@ -807,6 +820,9 @@ again:
 		goto bad;
 	}
 	mqd_release_lock(d);
+
+	/* perhaps it is best to duplicate this handle */
+
 	mq_wait_handle(d->not_full);
 	d = get_and_lock_mqd(des);
 	if (!d) {
@@ -865,46 +881,63 @@ bad:
 	return res;
 }
 
-unsigned __stdcall notify_proc(void *arg)
+void __cdecl *notify_proc(void *arg)
 {
 	mqd_t des = (mqd_t) arg;
-	int empty = 0;
 	DWORD pid = GetCurrentProcessId();
-	struct mqd *d = get_and_lock_mqd(des);
+	HANDLE proc = GetCurrentProcess();
+	pthread_t thread;
+	struct mqd *dp = get_and_lock_mqd(des);
+	void *res = (void *)EXIT_FAILURE;
+	BOOL err;
 
-	/*
-	 * The queue had been deleted before execution reached this point.
-	 */
-	if (!d)
-		return EXIT_FAILURE;
-	empty = !d->queue->curmsg;
+	if (!dp)
+		goto out;
 
-	while (!empty) {
-		unlock_and_wait(d->queue);
-		d = get_and_lock_mqd(des);
-		/* queue got deleted :( */
-		if (!d)
-			return EXIT_FAILURE;
-		empty = !d->queue->curmsg;
-	}
+	if (dp->queue->curmsg) {
+		/* if the queue already has messages, wait for it to become empty. */
+		if (release_and_wait(dp, dp->empty))
+			goto out;
 
-	switch (!wait_event(d->not_empty, 5000)) {
-	case WAIT_TIMEOUT:
-		break;
-	case WAIT_ABANDONED:
-		/* signal queue to be destroyed? */
-		return EXIT_FAILURE;
-	case WAIT_OBJECT_0:
-		d->notification.notify_proc();
-	}
-
-	if (d->notification->sigev_notify == SIGEV_NONE) {
-		memset(d->notification, 0, sizeof(d->notification));
-		if (d->queue->pid == GetCurrentProcessId()) {
-			d->queue->pid = 0;
+		/* The state of the queue is unknown at this point */
+		dp = get_and_lock_mqd(des);
+		if (!dp)
+			goto out;
+		if (dp->thread_should_terminate) {
+			return (void *)PTHREAD_CANCELLED;
 		}
 	}
-	return 0;
+
+	/* Assume that another thread may have gotten the message first. Loop until all messages are cleared. */
+	do {
+		/* if the queue does not have any messages, wait for one. */
+		if (release_and_wait(dp, dp->not_empty))
+			goto out;
+
+		/* The state of the queue is unknown at this point */
+		dp = get_and_lock_mqd(des);
+		if (!dp)
+			goto out;
+		if (dp->thread_should_terminate) {
+			return (void*)PTHREAD_CANCELLED;
+		}
+	} while (!dp->queue->curmsg);
+
+	/* finally handle the sigevent */
+	if (dp->notification.sigev_notify == SIGEV_THREAD) {
+		pthread_create(&thread,
+			       dp->notification.sigev_notify_attributes,
+			       dp->notification.sigev_notify_function,
+			       dp->notification.sigev_value.sival_ptr);
+		dp->queue->pid = 0;
+		mqd_release_lock(dp);
+		pthread_join(thread, &res);
+	} else {
+		res = (void *)EXIT_SUCCESS;
+	}
+
+out:
+	return res;
 }
 
 int mq_notify(mqd_t mqdes, const struct sigevent *notification)
@@ -917,25 +950,41 @@ int mq_notify(mqd_t mqdes, const struct sigevent *notification)
 		return -1;
 	}
 
-	if (!notification && d->queue->pid == pid) {
-		d->queue->pid = 0;
-		d->notification = NULL;
-		return 0;
+	if (!notification) {
+		/* cleanup */
+		if (d->queue->pid == pid) {
+			d->thread_should_terminate = 1;
+			pthread_cancel(d->thread);
+			d->queue->pid = 0;
+			return 0;
+		}
+
+		errno = EINVAL;
+		return -1;
 	}
 
-	if (!notification || d->queue->pid != 0) {
+	if (d->queue->pid) {
 		errno = EBUSY;
+		return -1;
+	}
+
+	if (notification->sigev_notify == SIGEV_SIGNAL) {
+		errno = ENOSYS;
+		return -1;
+	}
+
+	if (notification->sigev_notify != SIGEV_NONE
+	    || notification->sigev_notify != SIGEV_THREAD) {
+		errno = EINVAL;
 		return -1;
 	}
 
 	d->queue->pid = pid;
 	d->notification = *notification;
-	d->tid =
-	    _beginthreadex(NULL, 0, notify_proc, d, 1,
-			   STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-
-	if (d->tid == ((HANDLE) - 1)) {
-		errno = EOTHER;
+	d->thread_should_terminate = 0;
+	if (pthread_create
+	    (&d->thread, notification->sigev_notify_attributes, notify_proc,
+	     (void *)mqdes)) {
 		return -1;
 	}
 
